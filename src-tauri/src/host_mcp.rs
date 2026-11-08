@@ -448,7 +448,16 @@ fn join(shared: &Shared, named: bool, body: &str) -> Result<Join, StatusCode> {
             shared.stop.cancel();
             Err(StatusCode::NOT_FOUND)
         }
-        Some("server/discover" | "ping") if state != CLAIMED => Ok(Join::Outside),
+        // Shared-session MCP clients may release their HTTP transport and
+        // later reconnect with a fresh stateless probe. Hermes ACP does this
+        // for editor-provided MCP servers. The bearer token still gates the
+        // request; shared_session only permits the same authorized tool
+        // session to be rediscovered after its initial legacy claim.
+        Some("server/discover" | "ping")
+            if state != CLAIMED || shared.shared_session =>
+        {
+            Ok(Join::Outside)
+        }
         _ => Err(StatusCode::NOT_FOUND),
     }
 }
