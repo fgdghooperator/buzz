@@ -36,7 +36,7 @@ export const TIMMY_HOOKS: AcpHooks = {
 export const GROK_HOOKS: AcpHooks = {
   label: "Grok",
   program: "tcc-grok-acp",
-  missing: "The TCC Grok ACP runtime is unavailable.",
+  missing: "The FGD Grok ACP runtime is unavailable.",
   env: {},
 };
 

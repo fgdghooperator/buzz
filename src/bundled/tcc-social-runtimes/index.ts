@@ -110,12 +110,12 @@ export const apply: PluginModule["apply"] = (ctx) => {
 
   agents.register<Config>({
     id: "grok",
-    title: "TCC Grok",
+    title: "FGD Grok",
     icon: GrokLogoIcon,
     description:
-      "TCC X intelligence scout using native Grok ACP and X search.",
+      "FGD Grok agents using native Grok ACP and X search.",
     defaults: () => ({ config: DEFAULT_CONFIG }),
-    summary: () => "Grok 4.7 · X intelligence",
+    summary: () => "Grok 4.7 · FGD ACP",
     ...tccRun(grok),
   });
 
