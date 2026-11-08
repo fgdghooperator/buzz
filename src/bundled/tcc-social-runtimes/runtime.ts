@@ -731,7 +731,7 @@ export class TccRuntime {
     };
     entry.sessions = new AgentSessions(this.label, {
       resolveDirectory: (path) => this.desktop.resolveDirectory(path),
-      ...(this.hooks.requiresHttpMcp === false ? {} : { tools }),
+      tools,
       process: this.process,
       store: localSessions(this.storage, agent),
       started: (session, text) =>
