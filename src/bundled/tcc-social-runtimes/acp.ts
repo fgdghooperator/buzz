@@ -18,6 +18,7 @@ const hermesProfileHooks = (
   program,
   missing: `The ${label} Hermes ACP runtime is unavailable.`,
   requiresHttpMcp: false,
+  sharedMcpSession: true,
   env: {
     HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
   },
@@ -28,6 +29,7 @@ export const TIMMY_HOOKS: AcpHooks = {
   program: "tcc-timmy-acp",
   missing: "The TCC Timmy Hermes ACP runtime is unavailable.",
   requiresHttpMcp: false,
+  sharedMcpSession: true,
   env: {
     HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
   },

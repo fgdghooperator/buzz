@@ -253,7 +253,10 @@ export class AcpProcess {
     if (tools) {
       if (!this.serve)
         throw new Error(`This ${hooks.label} serves no Buzz tools`);
-      server = await this.serve((message) => this.mcp(tools, session, message));
+      server = await this.serve(
+        (message) => this.mcp(tools, session, message),
+        hooks.sharedMcpSession ? { sharedSession: true } : undefined,
+      );
     }
     const buzz: McpServer | undefined = server && {
       type: "http",

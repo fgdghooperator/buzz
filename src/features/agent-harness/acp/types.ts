@@ -12,7 +12,10 @@ export type Spawn = (
   id: string,
   options?: HostProcessOptions,
 ) => Promise<HostProcess>;
-export type ServeMcp = (handler: McpHandler) => Promise<HostMcpServer>;
+export type ServeMcp = (
+  handler: McpHandler,
+  options?: Readonly<{ sharedSession?: boolean }>,
+) => Promise<HostMcpServer>;
 /** The host's absolute path for a directory, resolving `~/…`. */
 export type ResolveDirectory = (path: string) => Promise<string>;
 
@@ -81,6 +84,9 @@ export type AcpHooks = Readonly<{
   /** Whether the harness must advertise HTTP MCP support. Defaults to true.
    * Some external ACP harnesses can run without Buzz tools. */
   requiresHttpMcp?: boolean;
+  /** Allow cooperating MCP clients in this harness to reuse one Buzz tool
+   * session/token. Needed by Hermes ACP. Defaults to false. */
+  sharedMcpSession?: boolean;
   /** Keeps stderr written before the host reports the spawn, and reads exit
    * 126 or 127 before `initialize` answers as `missing`: for a program the
    * owner launches through `env`. */
