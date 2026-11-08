@@ -2,10 +2,10 @@
   "id": "tcc.social-runtimes",
   "name": "TCC Social Runtimes",
   "apiVersion": 1,
-  "description": "Run the TCC Timmy and Grok agents in Buzz.",
+  "description": "Run the proven TCC runtimes and dedicated FGD Hermes agent profiles in Buzz.",
   "discovery": {
     "category": "agents",
-    "tags": ["TCC", "social", "agents"]
+    "tags": ["TCC", "FGD", "social", "agents"]
   },
   "host": {
     "processes": [
@@ -18,6 +18,36 @@
         "id": "tcc-grok-acp",
         "program": "grok",
         "args": ["agent", "--always-approve", "stdio"]
+      },
+      {
+        "id": "fgd-jimmy-acp",
+        "program": "hermes",
+        "args": ["-p", "jimmy", "acp"]
+      },
+      {
+        "id": "fgd-kenny-acp",
+        "program": "hermes",
+        "args": ["-p", "kenny", "acp"]
+      },
+      {
+        "id": "fgd-wendy-acp",
+        "program": "hermes",
+        "args": ["-p", "wendy", "acp"]
+      },
+      {
+        "id": "fgd-tweak-acp",
+        "program": "hermes",
+        "args": ["-p", "tweak", "acp"]
+      },
+      {
+        "id": "fgd-pip-acp",
+        "program": "hermes",
+        "args": ["-p", "pip", "acp"]
+      },
+      {
+        "id": "fgd-craig-acp",
+        "program": "hermes",
+        "args": ["-p", "craig", "acp"]
       }
     ],
     "mcp": true,

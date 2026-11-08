@@ -10,6 +10,19 @@ export type AcpHost = Readonly<{
   resolveDirectory(path: string): Promise<string>;
 }>;
 
+const hermesProfileHooks = (
+  label: string,
+  program: string,
+): AcpHooks => ({
+  label,
+  program,
+  missing: `The ${label} Hermes ACP runtime is unavailable.`,
+  requiresHttpMcp: false,
+  env: {
+    HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
+  },
+});
+
 export const TIMMY_HOOKS: AcpHooks = {
   label: "Timmy",
   program: "tcc-timmy-acp",
@@ -26,6 +39,36 @@ export const GROK_HOOKS: AcpHooks = {
   missing: "The TCC Grok ACP runtime is unavailable.",
   env: {},
 };
+
+export const JIMMY_HOOKS = hermesProfileHooks(
+  "FGD Jimmy",
+  "fgd-jimmy-acp",
+);
+
+export const KENNY_HOOKS = hermesProfileHooks(
+  "FGD Kenny",
+  "fgd-kenny-acp",
+);
+
+export const WENDY_HOOKS = hermesProfileHooks(
+  "FGD Wendy",
+  "fgd-wendy-acp",
+);
+
+export const TWEAK_HOOKS = hermesProfileHooks(
+  "FGD Tweak",
+  "fgd-tweak-acp",
+);
+
+export const PIP_HOOKS = hermesProfileHooks(
+  "FGD Pip",
+  "fgd-pip-acp",
+);
+
+export const CRAIG_HOOKS = hermesProfileHooks(
+  "FGD Craig",
+  "fgd-craig-acp",
+);
 
 export class SharedAcpProcess {
   private ready: Promise<AcpProcess> | undefined;
