@@ -175,7 +175,10 @@ export class AcpProcess {
       };
       signal?.throwIfAborted();
       acp.capabilities = init.agentCapabilities ?? {};
-      if (init.agentCapabilities?.mcpCapabilities?.http !== true)
+      if (
+        hooks.requiresHttpMcp !== false &&
+        init.agentCapabilities?.mcpCapabilities?.http !== true
+      )
         throw new Error(
           `This ${hooks.label} cannot reach Buzz tools (no HTTP MCP support)`,
         );

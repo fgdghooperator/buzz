@@ -78,6 +78,9 @@ export type AcpHooks = Readonly<{
   program: string;
   /** The error when that program cannot be found, or cannot run. */
   missing: string;
+  /** Whether the harness must advertise HTTP MCP support. Defaults to true.
+   * Some external ACP harnesses can run without Buzz tools. */
+  requiresHttpMcp?: boolean;
   /** Keeps stderr written before the host reports the spawn, and reads exit
    * 126 or 127 before `initialize` answers as `missing`: for a program the
    * owner launches through `env`. */

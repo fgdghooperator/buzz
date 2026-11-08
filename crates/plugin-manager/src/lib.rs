@@ -489,6 +489,10 @@ pub fn bundled_manifests() -> Vec<Manifest> {
             .expect("codex manifest"),
         serde_json::from_str(include_str!("../../../src/bundled/goose/manifest.json"))
             .expect("goose manifest"),
+        serde_json::from_str(include_str!(
+            "../../../src/bundled/tcc-social-runtimes/manifest.json"
+        ))
+        .expect("tcc social runtimes manifest"),
         serde_json::from_str(include_str!("../../../src/bundled/pi/manifest.json"))
             .expect("pi manifest"),
         serde_json::from_str(include_str!("../../../src/bundled/workflows/manifest.json"))
@@ -541,6 +545,7 @@ fn enabled_by_default(id: &str) -> bool {
             | "buzz.claude-code"
             | "buzz.codex"
             | "buzz.goose"
+            | "tcc.social-runtimes"
             | "block.builderlab"
             | "buzz.moderation"
             | "buzz.relay-staff"

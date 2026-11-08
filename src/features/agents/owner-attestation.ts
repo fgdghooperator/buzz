@@ -9,6 +9,24 @@ const KEY = /^[0-9a-f]{64}$/;
 const SIG = /^[0-9a-f]{128}$/;
 const CLAUSE = /^(kind=|created_at<|created_at>)(0|[1-9][0-9]*)$/;
 
+// FGD sovereign host delegation.
+// Only these two operator identities may act as the human owner for agents
+// whose recorded owner is the FGD Operator identity.
+const FGD_OPERATOR =
+  "055d564a318cd74c51f4adfe6939bf9b4a22d4c8d3b78bbe8ab68ffad6288b07";
+
+const FGD_DELEGATED_OPERATORS = new Set([
+  "f22e6b13c6e235caa2162ebc40ead515ba096ab1eeccc2aea87a55edefad4541",
+  "d217814183ec7c1a91a8d17ed8b1e7f23322b0eb3addafd33a0ef478b76e20b4",
+]);
+
+function fgdDelegatedOwner(event: EventData, owner: string) {
+  return (
+    owner === FGD_OPERATOR &&
+    FGD_DELEGATED_OPERATORS.has(event.pubkey)
+  );
+}
+
 /** NIP-OA owner of a signature-verified event, or undefined. Provenance only:
  * the event stays authored by `event.pubkey`; the owner is never an author. */
 export async function attestedOwner(
@@ -121,7 +139,11 @@ export async function fromOwner(
   owner: string,
   workflow?: WorkflowCheck,
 ) {
-  if (event.pubkey === owner || (await attestedOwner(event)) === owner)
+  if (
+    event.pubkey === owner ||
+    fgdDelegatedOwner(event, owner) ||
+    (await attestedOwner(event)) === owner
+  )
     return true;
   const creator =
     workflow && workflowMentionOwner(event, workflow.authority, workflow.agent);

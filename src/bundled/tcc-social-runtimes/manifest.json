@@ -1,0 +1,26 @@
+{
+  "id": "tcc.social-runtimes",
+  "name": "TCC Social Runtimes",
+  "apiVersion": 1,
+  "description": "Run the TCC Timmy and Grok agents in Buzz.",
+  "discovery": {
+    "category": "agents",
+    "tags": ["TCC", "social", "agents"]
+  },
+  "host": {
+    "processes": [
+      {
+        "id": "tcc-timmy-acp",
+        "program": "hermes",
+        "args": ["-p", "timmy", "acp"]
+      },
+      {
+        "id": "tcc-grok-acp",
+        "program": "grok",
+        "args": ["agent", "--always-approve", "stdio"]
+      }
+    ],
+    "mcp": true,
+    "files": true
+  }
+}

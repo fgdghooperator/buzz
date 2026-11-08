@@ -128,8 +128,9 @@ export type SessionsOptions = Readonly<{
   label: string;
   /** The host's, for the workspace's absolute path. */
   resolveDirectory: ResolveDirectory;
-  /** Answers the agent's Buzz tools. */
-  tools: ToolServer;
+  /** Answers the agent's Buzz tools. When omitted, the session has no
+   * Buzz MCP tool server. */
+  tools?: ToolServer;
   /** The process its sessions open in, started when needed. */
   process: Readonly<{ get(): Promise<AcpProcess> }>;
   /** The servers its sessions hold: the shared pool unless given. */
@@ -571,7 +572,7 @@ export class AgentSessions {
         systemPrompt: launch.systemPrompt,
         ...(title ? { title } : {}),
         ...(named ? { named } : {}),
-        tools: this.options.tools,
+        ...(this.options.tools ? { tools: this.options.tools } : {}),
         choice: this.options.choice,
       });
     let session: AcpSession;
