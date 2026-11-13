@@ -6,6 +6,7 @@ use archive::relay_archive;
 mod browser;
 #[cfg(target_os = "macos")]
 mod close_menu;
+mod control_plane;
 mod oauth_callback;
 use oauth_callback::{
     oauth_callback_begin, oauth_callback_cancel, oauth_callback_complete, oauth_callback_wait,
@@ -691,6 +692,12 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         relay_http,
         relay_http_cancel,
         relay_verify_signatures,
+        control_plane::control_plane_observe_ack,
+        control_plane::control_plane_smoke_prepare,
+        control_plane::control_plane_smoke_snapshot,
+        control_plane::control_plane_smoke_begin_release,
+        control_plane::control_plane_smoke_record_sent,
+        control_plane::control_plane_smoke_reconcile,
         relay_workflow_runs,
         relay_admin::relay_admin_discover,
         relay_admin::relay_admin_request,
@@ -1092,6 +1099,7 @@ pub fn run() {
         .manage(HostCalls::default())
         .manage(HostProcesses::default())
         .manage(HostMcpServers::default())
+        .manage(control_plane::ControlPlaneHost::default())
         .manage(OAuthCallbackHost::default())
         .manage(NsecBackupHost::default().with_federated_identity(federated_identity))
         .manage(Notifications::default())
