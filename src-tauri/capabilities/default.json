@@ -56,7 +56,6 @@
     "allow-relay-http",
     "allow-relay-http-cancel",
     "allow-relay-verify-signatures",
-    "allow-control-plane-smoke-prepare",
     "allow-relay-workflow-runs",
     "allow-relay-admin-discover",
     "allow-relay-admin-request",

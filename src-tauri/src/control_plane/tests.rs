@@ -1,13 +1,22 @@
 use super::store::{
-    canonical_database_path, AckOutcome, BlockerInput, BlockerRoute, DispatchState, Evaluation,
+    AckOutcome, BlockerInput, BlockerRoute, DispatchState, Evaluation,
     HumanAuthorityAdmissionInput, NewObjective, ObjectiveState, ProofInput, ProofKind,
     SignedAckEvent, SilentReason, SmokePrepareInput, Store, WakeIntentInput,
 };
-use super::ControlPlaneHost;
-use crate::sign_out::legacy_identifier::{CURRENT, DEV};
 use rusqlite::types::Value;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unix_now() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
 
 fn active<'a>(id: &'a str, owner: &'a str, now: i64, review_at: i64) -> NewObjective<'a> {
     let recovery_policy = match review_at - now {
@@ -70,7 +79,7 @@ const SMOKE_CHANNEL: &str = "51d885db-c687-44a6-8f2c-01bd679e7bb0";
 const SMOKE_ROOT: &str = "a5b8732af2784b1525f39f4fc5d1472835ced60cc8aa1ea43968bd6e92b32e3b";
 
 #[test]
-fn main_webview_acl_allows_only_smoke_prepare() {
+fn first_slice_is_not_registered_or_exposed_to_the_main_webview() {
     let build = include_str!("../../build.rs");
     let native_lib = include_str!("../lib.rs");
     let capability: serde_json::Value =
@@ -82,19 +91,16 @@ fn main_webview_acl_allows_only_smoke_prepare() {
             .any(|entry| entry.as_str() == Some(permission))
     };
 
-    assert!(build.contains("\"control_plane_smoke_prepare\""));
-    assert!(has_permission("allow-control-plane-smoke-prepare"));
-    assert!(!build.contains("admit_human_authority"));
-    assert!(!native_lib.contains("admit_human_authority"));
-    assert!(!has_permission("allow-admit-human-authority"));
-
     for command in [
+        "control_plane_observe_ack",
+        "control_plane_smoke_prepare",
         "control_plane_smoke_snapshot",
         "control_plane_smoke_begin_release",
         "control_plane_smoke_record_sent",
         "control_plane_smoke_reconcile",
     ] {
         assert!(!build.contains(&format!("\"{command}\"")));
+        assert!(!native_lib.contains(&format!("control_plane::{command}")));
         assert!(!has_permission(&format!(
             "allow-{}",
             command.replace('_', "-")
@@ -402,31 +408,6 @@ fn migrated_v3_objectives_enforce_fresh_insert_and_update_constraints() {
 }
 
 #[test]
-fn canonical_path_uses_release_app_data_for_dev_and_reopens_the_same_database() {
-    let root = tempfile::tempdir().unwrap();
-    let release_app_data = root.path().join(CURRENT);
-    let dev_app_data = root.path().join(DEV);
-    let release = canonical_database_path(CURRENT, &release_app_data).unwrap();
-    let dev = canonical_database_path(DEV, &dev_app_data).unwrap();
-    assert_eq!(release, dev);
-    assert_eq!(
-        release,
-        release_app_data
-            .join("control-plane")
-            .join("control-plane.sqlite3")
-    );
-
-    let mut store = Store::open(release.clone()).unwrap();
-    store
-        .create_active(active("REMH-1", "kenny-live-key", 100, 1_000))
-        .unwrap();
-    drop(store);
-
-    let reopened = Store::open(dev).unwrap();
-    assert_eq!(reopened.objective("REMH-1").unwrap().unwrap().generation, 1);
-}
-
-#[test]
 fn version_one_intervention_migrates_to_non_replayable_outbox_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("control-plane.sqlite3");
@@ -509,6 +490,7 @@ fn every_qualifying_remh_proof_kind_advances_supervision() {
     for (index, kind) in kinds.into_iter().enumerate() {
         let occurred_at = 200 + index as i64;
         let reference = format!("bounded-reference-{index}");
+        let digest = format!("sha256:bounded-{index}");
         let needs_result = matches!(
             kind,
             ProofKind::TestResult | ProofKind::ReviewResult | ProofKind::DeploymentPreflight
@@ -521,7 +503,7 @@ fn every_qualifying_remh_proof_kind_advances_supervision() {
                 occurred_at,
                 observed_at: occurred_at,
                 reference: &reference,
-                digest: (!needs_result).then_some("sha256:bounded"),
+                digest: (!needs_result).then_some(digest.as_str()),
                 result: needs_result.then_some("PASS"),
             })
             .unwrap();
@@ -1110,31 +1092,6 @@ fn durable_outbox_advances_pending_claimed_wake_intent_sent_acked() {
     assert_eq!(
         store.dispatch(id).unwrap().unwrap().state,
         DispatchState::Acked
-    );
-}
-
-#[test]
-fn host_observer_reopens_the_registry_and_acknowledges_a_signed_projection() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("control-plane.sqlite3");
-    let mut store = Store::open(path.clone()).unwrap();
-    store
-        .create_active(active("REMH-HOST-ACK", "fgd-smoke-agent", 100, 200))
-        .unwrap();
-    let id = reserve(&mut store, "REMH-HOST-ACK", 1, 300);
-    freeze(&mut store, id, 301, "host-ack-1");
-    store.record_sent(id, 303).unwrap();
-    drop(store);
-
-    let host = ControlPlaneHost::open(path).unwrap();
-    assert_eq!(
-        host.observe_ack(ack(
-            "event-host-ack",
-            "FGD_ACK:REMH-HOST-ACK:1:host-ack-1",
-            304,
-        ))
-        .unwrap(),
-        AckOutcome::Acknowledged(id)
     );
 }
 
@@ -1773,6 +1730,106 @@ fn duplicate_stale_old_generation_and_future_skew_proof_cannot_advance() {
         2
     );
     assert_eq!(store.proofs("REMH-QUALIFY").unwrap().len(), 1);
+}
+
+#[test]
+fn caller_supplied_future_timestamps_cannot_advance_or_postpone_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("control-plane.sqlite3")).unwrap();
+    store
+        .create_active(active("REMH-TRUSTED-TIME", "kenny", 100, 1_000))
+        .unwrap();
+    let before = store.objective("REMH-TRUSTED-TIME").unwrap().unwrap();
+    let future = unix_now() + 3_600;
+
+    assert!(store
+        .record_qualified_proof(ProofInput {
+            objective_id: "REMH-TRUSTED-TIME",
+            expected_generation: 1,
+            kind: ProofKind::Commit,
+            occurred_at: future,
+            observed_at: future,
+            reference: "commit:future-caller-clock",
+            digest: Some("sha256:future-caller-clock"),
+            result: None,
+        })
+        .is_err());
+
+    assert_eq!(
+        store.objective("REMH-TRUSTED-TIME").unwrap().unwrap(),
+        before
+    );
+    assert!(store.proofs("REMH-TRUSTED-TIME").unwrap().is_empty());
+}
+
+#[test]
+fn canonical_digest_identity_rejects_replay_under_a_different_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("control-plane.sqlite3")).unwrap();
+    store
+        .create_active(active("REMH-CANONICAL-PROOF", "kenny", 100, 1_000))
+        .unwrap();
+    let first = store
+        .record_qualified_proof(ProofInput {
+            objective_id: "REMH-CANONICAL-PROOF",
+            expected_generation: 1,
+            kind: ProofKind::Commit,
+            occurred_at: 200,
+            observed_at: 201,
+            reference: "commit:first-reference",
+            digest: Some("sha256:immutable-evidence"),
+            result: None,
+        })
+        .unwrap();
+
+    assert!(store
+        .record_qualified_proof(ProofInput {
+            objective_id: "REMH-CANONICAL-PROOF",
+            expected_generation: 2,
+            kind: ProofKind::Commit,
+            occurred_at: 300,
+            observed_at: 301,
+            reference: "commit:different-reference",
+            digest: Some("sha256:immutable-evidence"),
+            result: None,
+        })
+        .is_err());
+
+    assert_eq!(
+        store.objective("REMH-CANONICAL-PROOF").unwrap().unwrap(),
+        first
+    );
+    assert_eq!(store.proofs("REMH-CANONICAL-PROOF").unwrap().len(), 1);
+}
+
+#[test]
+fn empty_or_blank_evidence_digests_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("control-plane.sqlite3")).unwrap();
+    store
+        .create_active(active("REMH-DIGEST-VALIDATION", "kenny", 100, 1_000))
+        .unwrap();
+
+    for (reference, digest) in [("commit:empty", ""), ("commit:blank", "   ")] {
+        assert!(store
+            .record_qualified_proof(ProofInput {
+                objective_id: "REMH-DIGEST-VALIDATION",
+                expected_generation: 1,
+                kind: ProofKind::Commit,
+                occurred_at: 200,
+                observed_at: 201,
+                reference,
+                digest: Some(digest),
+                result: None,
+            })
+            .is_err());
+    }
+
+    let objective = store.objective("REMH-DIGEST-VALIDATION").unwrap().unwrap();
+    assert_eq!(objective.generation, 1);
+    assert_eq!(objective.last_verified_progress_at, 100);
+    assert_eq!(objective.next_review_at, Some(1_000));
+    assert!(store.proofs("REMH-DIGEST-VALIDATION").unwrap().is_empty());
 }
 
 #[test]

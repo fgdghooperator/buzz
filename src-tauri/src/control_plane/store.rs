@@ -1,6 +1,6 @@
-use crate::sign_out::legacy_identifier::{CURRENT, DEV};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) type Result<T> = std::result::Result<T, String>;
 
@@ -11,20 +11,6 @@ const SMOKE_ROOT: &str = "a5b8732af2784b1525f39f4fc5d1472835ced60cc8aa1ea43968bd
 
 fn database<T>(result: rusqlite::Result<T>) -> Result<T> {
     result.map_err(|error| format!("Control-plane storage failed: {error}"))
-}
-
-pub(super) fn canonical_database_path(identifier: &str, app_data: &Path) -> Result<PathBuf> {
-    let canonical = match identifier {
-        CURRENT => app_data.to_path_buf(),
-        DEV => app_data
-            .parent()
-            .ok_or("Control-plane app-data parent unavailable")?
-            .join(CURRENT),
-        _ => app_data.to_path_buf(),
-    };
-    Ok(canonical
-        .join("control-plane")
-        .join("control-plane.sqlite3"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,18 +183,6 @@ pub(super) enum DispatchState {
 }
 
 impl DispatchState {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "PENDING",
-            Self::Claimed => "CLAIMED",
-            Self::WakeIntent => "WAKE_INTENT",
-            Self::Sent => "SENT",
-            Self::Acked => "ACKED",
-            Self::VerifyBeforeRetry => "VERIFY_BEFORE_RETRY",
-            Self::Failed => "FAILED",
-        }
-    }
-
     fn parse(value: &str) -> Result<Self> {
         match value {
             "PENDING" => Ok(Self::Pending),
@@ -477,6 +451,8 @@ impl Store {
 
     pub(super) fn record_qualified_proof(&mut self, proof: ProofInput<'_>) -> Result<Objective> {
         validate_proof(&proof)?;
+        validate_proof_time(&proof, trusted_unix_time()?)?;
+        let canonical_identity = canonical_proof_identity(&proof);
         let tx = database(
             self.connection
                 .transaction_with_behavior(TransactionBehavior::Immediate),
@@ -489,19 +465,7 @@ impl Store {
         if objective.generation != proof.expected_generation {
             return Err("Proof generation is stale".into());
         }
-        let latest_allowed = proof
-            .observed_at
-            .checked_add(300)
-            .ok_or("Proof timestamp exceeds the allowed future skew")?;
-        if proof.occurred_at > latest_allowed {
-            return Err("Proof timestamp exceeds the allowed future skew".into());
-        }
-        let duplicate = database(tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM proof_events WHERE objective_id=?1 AND reference=?2)",
-            params![proof.objective_id, proof.reference],
-            |row| row.get::<_, bool>(0),
-        ))?;
-        if duplicate {
+        if duplicate_proof(&tx, &proof, &canonical_identity)? {
             return Err("Duplicate proof cannot advance an objective".into());
         }
         let advances = proof_advances(&proof)?;
@@ -518,8 +482,8 @@ impl Store {
             "NON_ADVANCING"
         };
         database(tx.execute(
-            "INSERT INTO proof_events(objective_id,source_generation,resulting_generation,proof_type,occurred_at,observed_at,classification,advances_generation,reference,new_event_identity,digest,result,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?6)",
-            params![proof.objective_id,objective.generation,generation,proof.kind.as_str(),proof.occurred_at,proof.observed_at,classification,i64::from(advances),proof.reference,proof.digest,proof.result],
+            "INSERT INTO proof_events(objective_id,source_generation,resulting_generation,proof_type,occurred_at,observed_at,classification,advances_generation,reference,new_event_identity,digest,result,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?6)",
+            params![proof.objective_id,objective.generation,generation,proof.kind.as_str(),proof.occurred_at,proof.observed_at,classification,i64::from(advances),proof.reference,canonical_identity,proof.digest,proof.result],
         ))?;
         if advances {
             let next_review_at =
@@ -557,6 +521,8 @@ impl Store {
             return Err("AWAITING_OWNER requires admitted human authority".into());
         }
         validate_proof(&proof)?;
+        validate_proof_time(&proof, trusted_unix_time()?)?;
+        let canonical_identity = canonical_proof_identity(&proof);
         if proof.result != Some("READY FOR OWNER TEST") {
             return Err("Owner-test packet requires the exact READY FOR OWNER TEST result".into());
         }
@@ -572,19 +538,7 @@ impl Store {
         if objective.generation != proof.expected_generation {
             return Err("Owner-test packet generation is stale".into());
         }
-        let latest_allowed = proof
-            .observed_at
-            .checked_add(300)
-            .ok_or("Owner-test packet timestamp exceeds the allowed future skew")?;
-        if proof.occurred_at > latest_allowed {
-            return Err("Owner-test packet timestamp exceeds the allowed future skew".into());
-        }
-        let duplicate = database(tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM proof_events WHERE objective_id=?1 AND reference=?2)",
-            params![proof.objective_id, proof.reference],
-            |row| row.get::<_, bool>(0),
-        ))?;
-        if duplicate {
+        if duplicate_proof(&tx, &proof, &canonical_identity)? {
             return Err("Duplicate owner-test packet cannot advance an objective".into());
         }
         if proof.occurred_at <= objective.last_verified_progress_at {
@@ -606,8 +560,8 @@ impl Store {
             params![proof.objective_id,objective.generation,proof.reference,authority_admission_reference,updated_at],
         ))?;
         database(tx.execute(
-            "INSERT INTO proof_events(objective_id,source_generation,resulting_generation,proof_type,occurred_at,observed_at,classification,advances_generation,reference,new_event_identity,digest,result,created_at) VALUES (?1,?2,?3,?4,?5,?6,'ADVANCING',1,?7,?7,?8,?9,?6)",
-            params![proof.objective_id,objective.generation,generation,proof.kind.as_str(),proof.occurred_at,proof.observed_at,proof.reference,proof.digest,proof.result],
+            "INSERT INTO proof_events(objective_id,source_generation,resulting_generation,proof_type,occurred_at,observed_at,classification,advances_generation,reference,new_event_identity,digest,result,created_at) VALUES (?1,?2,?3,?4,?5,?6,'ADVANCING',1,?7,?8,?9,?10,?6)",
+            params![proof.objective_id,objective.generation,generation,proof.kind.as_str(),proof.occurred_at,proof.observed_at,proof.reference,canonical_identity,proof.digest,proof.result],
         ))?;
         database(tx.execute(
             "UPDATE objectives SET state='AWAITING_OWNER',generation=?2,last_verified_progress_at=?3,next_review_at=NULL,next_action='await owner instruction',updated_at=?4 WHERE objective_id=?1 AND generation=?5",
@@ -764,6 +718,8 @@ impl Store {
 
     pub(super) fn complete_objective(&mut self, proof: ProofInput<'_>) -> Result<Objective> {
         validate_proof(&proof)?;
+        validate_proof_time(&proof, trusted_unix_time()?)?;
+        let canonical_identity = canonical_proof_identity(&proof);
         if proof.kind != ProofKind::ReviewResult || proof.result != Some("FINAL_PASS") {
             return Err("Objective completion requires a FINAL_PASS review proof".into());
         }
@@ -778,13 +734,7 @@ impl Store {
         {
             return Err("Completion requires the current ACTIVE generation".into());
         }
-        let latest_allowed = proof
-            .observed_at
-            .checked_add(300)
-            .ok_or("Final proof is stale or future-skewed")?;
-        if proof.occurred_at <= objective.last_verified_progress_at
-            || proof.occurred_at > latest_allowed
-        {
+        if proof.occurred_at <= objective.last_verified_progress_at {
             return Err("Final proof is stale or future-skewed".into());
         }
         let resource_counts: (i64, i64) = database(tx.query_row(
@@ -795,12 +745,7 @@ impl Store {
         if resource_counts.0 == 0 || resource_counts.0 != resource_counts.1 {
             return Err("All required resources must be reconciled before completion".into());
         }
-        let duplicate = database(tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM proof_events WHERE objective_id=?1 AND reference=?2)",
-            params![proof.objective_id, proof.reference],
-            |row| row.get::<_, bool>(0),
-        ))?;
-        if duplicate {
+        if duplicate_proof(&tx, &proof, &canonical_identity)? {
             return Err("Duplicate final proof cannot complete an objective".into());
         }
         let generation = objective
@@ -808,8 +753,8 @@ impl Store {
             .checked_add(1)
             .ok_or("Control-plane generation overflow")?;
         database(tx.execute(
-            "INSERT INTO proof_events(objective_id,source_generation,resulting_generation,proof_type,occurred_at,observed_at,classification,advances_generation,reference,new_event_identity,digest,result,created_at) VALUES (?1,?2,?3,?4,?5,?6,'FINAL',1,?7,?7,?8,?9,?6)",
-            params![proof.objective_id,objective.generation,generation,proof.kind.as_str(),proof.occurred_at,proof.observed_at,proof.reference,proof.digest,proof.result],
+            "INSERT INTO proof_events(objective_id,source_generation,resulting_generation,proof_type,occurred_at,observed_at,classification,advances_generation,reference,new_event_identity,digest,result,created_at) VALUES (?1,?2,?3,?4,?5,?6,'FINAL',1,?7,?8,?9,?10,?6)",
+            params![proof.objective_id,objective.generation,generation,proof.kind.as_str(),proof.occurred_at,proof.observed_at,proof.reference,canonical_identity,proof.digest,proof.result],
         ))?;
         let changed = database(tx.execute(
             "UPDATE objectives SET state='OBJECTIVE_COMPLETE',generation=?2,last_verified_progress_at=?3,next_review_at=NULL,next_action='objective complete',updated_at=?4 WHERE objective_id=?1 AND generation=?5 AND state='ACTIVE'",
@@ -1393,7 +1338,11 @@ fn consume_human_authority(
 fn validate_proof(proof: &ProofInput<'_>) -> Result<()> {
     if proof.reference.is_empty()
         || proof.reference.len() > 512
-        || proof.digest.is_some_and(|value| value.len() > 128)
+        || proof.digest.is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 128
+                || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        })
         || proof.result.is_some_and(|value| value.len() > 512)
         || proof.expected_generation < 1
         || proof.observed_at < 0
@@ -1401,6 +1350,52 @@ fn validate_proof(proof: &ProofInput<'_>) -> Result<()> {
         return Err("Invalid bounded proof record".into());
     }
     Ok(())
+}
+
+fn trusted_unix_time() -> Result<i64> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Trusted native clock is before the Unix epoch")?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| "Trusted native clock exceeds supported range".into())
+}
+
+fn validate_proof_time(proof: &ProofInput<'_>, trusted_now: i64) -> Result<()> {
+    let latest_from_observation = proof
+        .observed_at
+        .checked_add(300)
+        .ok_or("Proof timestamp exceeds the allowed range")?;
+    if proof.occurred_at > latest_from_observation
+        || proof.occurred_at > trusted_now
+        || proof.observed_at > trusted_now
+    {
+        return Err("Proof timestamp exceeds the trusted native clock".into());
+    }
+    Ok(())
+}
+
+fn canonical_proof_identity(proof: &ProofInput<'_>) -> String {
+    proof
+        .digest
+        .map(|digest| format!("digest:{digest}"))
+        .unwrap_or_else(|| proof.reference.to_string())
+}
+
+fn duplicate_proof(
+    connection: &Connection,
+    proof: &ProofInput<'_>,
+    canonical_identity: &str,
+) -> Result<bool> {
+    database(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM proof_events WHERE objective_id=?1 AND (new_event_identity=?2 OR reference=?3 OR (?4 IS NOT NULL AND digest=?4)))",
+        params![
+            proof.objective_id,
+            canonical_identity,
+            proof.reference,
+            proof.digest
+        ],
+        |row| row.get::<_, bool>(0),
+    ))
 }
 
 fn proof_advances(proof: &ProofInput<'_>) -> Result<bool> {
