@@ -167,6 +167,18 @@ fn query_values(
         .collect()
 }
 
+fn control_plane_tables(connection: &rusqlite::Connection) -> Vec<String> {
+    connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
 fn assert_v4_migration_parity(db: &rusqlite::Connection) {
     let indexes: Vec<String> = db
         .prepare("SELECT name FROM sqlite_master WHERE type='index' ORDER BY name")
@@ -426,14 +438,20 @@ fn version_one_intervention_migrates_to_non_replayable_outbox_evidence() {
     let objective_before = query_values(&db, "SELECT * FROM objectives", 12);
     drop(db);
 
-    let store = Store::open(path.clone()).unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
     let migrated = store.dispatches("REMH-V1").unwrap();
     assert_eq!(migrated.len(), 1);
     assert_eq!(migrated[0].state, DispatchState::VerifyBeforeRetry);
     assert_eq!(migrated[0].idempotency_key.as_deref(), Some("legacy-v1:1"));
     assert_eq!(store.exceptions("REMH-V1").unwrap().len(), 1);
+    assert_eq!(
+        store
+            .evaluate("REMH-V1", 1, 400, "fgd-smoke-agent")
+            .unwrap(),
+        Evaluation::Silent(SilentReason::AlreadyIntervened)
+    );
     drop(store);
-    let db = rusqlite::Connection::open(path).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
     let violations: i64 = db
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -445,6 +463,15 @@ fn version_one_intervention_migrates_to_non_replayable_outbox_evidence() {
         objective_before
     );
     assert_v4_migration_parity(&db);
+
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh_path = fresh_dir.path().join("control-plane.sqlite3");
+    drop(Store::open(fresh_path.clone()).unwrap());
+    let fresh_db = rusqlite::Connection::open(fresh_path).unwrap();
+    assert_eq!(control_plane_tables(&db), control_plane_tables(&fresh_db));
+    assert!(control_plane_tables(&db)
+        .iter()
+        .any(|table| table == "provider_circuits"));
 }
 
 #[test]

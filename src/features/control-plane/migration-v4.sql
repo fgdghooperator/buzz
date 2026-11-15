@@ -98,6 +98,28 @@ BEGIN
   SELECT RAISE(ABORT, 'proof ledger is append-only');
 END;
 
+CREATE TABLE IF NOT EXISTS provider_circuits (
+  client_scope TEXT PRIMARY KEY NOT NULL CHECK(client_scope = 'REMH'),
+  failure_count INTEGER NOT NULL CHECK(failure_count >= 1),
+  last_failure_at INTEGER NOT NULL,
+  open_until INTEGER NOT NULL,
+  last_error_code TEXT NOT NULL CHECK(length(last_error_code) BETWEEN 1 AND 128)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS leases (
+  objective_id TEXT NOT NULL REFERENCES objectives(objective_id),
+  generation INTEGER NOT NULL,
+  holder TEXT NOT NULL CHECK(length(holder) BETWEEN 1 AND 256),
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(objective_id, generation)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS event_cursors (
+  source TEXT PRIMARY KEY NOT NULL CHECK(length(source) BETWEEN 1 AND 256),
+  cursor TEXT NOT NULL CHECK(length(cursor) BETWEEN 1 AND 512),
+  updated_at INTEGER NOT NULL
+) STRICT;
+
 CREATE TABLE human_authority_admissions (
   admission_reference TEXT PRIMARY KEY NOT NULL CHECK(length(admission_reference) BETWEEN 1 AND 512),
   objective_id TEXT NOT NULL REFERENCES objectives(objective_id),
