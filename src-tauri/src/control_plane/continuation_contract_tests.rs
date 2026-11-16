@@ -3,7 +3,8 @@ use super::continuation_contract::{
     ObserveOutcome, RouteReason, RouteTarget, SandboxEffectSink, Stage,
 };
 use super::store::{
-    ActivationReceipt, ActivationResolutionInput, ActivationResolutionOutcome, DispatchState,
+    ActivationReceipt, ActivationResolutionAuthorityInput, ActivationResolutionInput,
+    ActivationResolutionOutcome, DispatchState,
 };
 use super::tests::{active, boundary_agent_records, boundary_routes, ready_activation};
 use super::{activation_boundary::fence_binding, store::Store};
@@ -248,6 +249,50 @@ fn stall_recovery_is_one_shot_across_restart_and_new_progress_advances_generatio
     assert_eq!(counts.admit, 3);
 }
 
+#[test]
+fn mutable_deadline_cannot_mint_an_extra_recovery_for_the_same_material_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("continuation.sqlite3");
+    let sink = CountingSink::default();
+    let counts = sink.counts.clone();
+    let accepted = snapshot("REM-165-DEADLINE", 1, Stage::SelfTest, 100);
+    let mut adapter = DisabledContinuationAdapter::open(path.clone(), sink).unwrap();
+    assert!(matches!(
+        adapter.observe(&accepted, 150).unwrap(),
+        ObserveOutcome::Planned(_)
+    ));
+
+    let mut earlier = snapshot("REM-165-DEADLINE", 1, Stage::SelfTest, 151);
+    earlier.next_review_at = 160;
+    assert!(matches!(
+        adapter.observe(&earlier, 175).unwrap(),
+        ObserveOutcome::Silent(_)
+    ));
+
+    let mut later = snapshot("REM-165-DEADLINE", 1, Stage::SelfTest, 176);
+    later.next_review_at = 300;
+    let recovery = match adapter.observe(&later, 200).unwrap() {
+        ObserveOutcome::Planned(dispatch) => dispatch,
+        other => panic!("expected recovery at the accepted deadline, got {other:?}"),
+    };
+    drop(adapter);
+
+    let mut restarted = DisabledContinuationAdapter::open(
+        path,
+        CountingSink {
+            counts: counts.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        restarted.observe(&later, 300).unwrap(),
+        ObserveOutcome::Silent(_)
+    ));
+    let counts = counts.lock().unwrap();
+    assert_eq!((counts.preflight, counts.admit), (2, 2));
+    assert!(recovery.recovery_identity.is_some());
+}
+
 fn exact_receipt(dispatch: &super::store::Dispatch, admitted_at: i64) -> ActivationReceipt {
     ActivationReceipt::from_dispatch(dispatch, admitted_at).unwrap()
 }
@@ -323,6 +368,57 @@ fn authorised_abandonment_is_auditable_non_replayable_and_does_not_advance_gener
         .reconcile_activation_startup("relay", "1", &[], 600, 500)
         .unwrap();
     let quarantined = store.dispatch(frozen.id).unwrap().unwrap();
+
+    assert!(store
+        .resolve_uncertain_activation(
+            ActivationResolutionInput {
+                dispatch_id: quarantined.id,
+                actor: "matt",
+                authority_role: "OWNER",
+                admission_reference: "owner:rem-165:abandon-1",
+                decided_at: 601,
+                reason: "a role string alone must not authorize permanent abandonment",
+                outcome: ActivationResolutionOutcome::AbandonedNoReplay,
+                receipt: None,
+            },
+            601,
+        )
+        .is_err());
+    store
+        .admit_activation_resolution_authority(ActivationResolutionAuthorityInput {
+            dispatch_id: quarantined.id,
+            actor: "matt",
+            authority_role: "OWNER",
+            admission_reference: "owner:rem-165:wrong-outcome",
+            outcome: ActivationResolutionOutcome::ConfirmedSent,
+            admitted_at: 601,
+        })
+        .unwrap();
+    assert!(store
+        .resolve_uncertain_activation(
+            ActivationResolutionInput {
+                dispatch_id: quarantined.id,
+                actor: "matt",
+                authority_role: "OWNER",
+                admission_reference: "owner:rem-165:wrong-outcome",
+                decided_at: 601,
+                reason: "authority for another outcome must not authorize abandonment",
+                outcome: ActivationResolutionOutcome::AbandonedNoReplay,
+                receipt: None,
+            },
+            601,
+        )
+        .is_err());
+    store
+        .admit_activation_resolution_authority(ActivationResolutionAuthorityInput {
+            dispatch_id: quarantined.id,
+            actor: "matt",
+            authority_role: "OWNER",
+            admission_reference: "owner:rem-165:abandon-1",
+            outcome: ActivationResolutionOutcome::AbandonedNoReplay,
+            admitted_at: 601,
+        })
+        .unwrap();
 
     let resolved = store
         .resolve_uncertain_activation(
@@ -408,6 +504,16 @@ fn confirmed_sent_resolution_still_requires_the_exact_receipt() {
         .unwrap();
     let quarantined = store.dispatch(frozen.id).unwrap().unwrap();
     let receipt = exact_receipt(&quarantined, 303);
+    store
+        .admit_activation_resolution_authority(ActivationResolutionAuthorityInput {
+            dispatch_id: quarantined.id,
+            actor: "supervisor",
+            authority_role: "SUPERVISOR",
+            admission_reference: "supervisor:rem-165:confirmed-1",
+            outcome: ActivationResolutionOutcome::ConfirmedSent,
+            admitted_at: 601,
+        })
+        .unwrap();
 
     let resolved = store
         .resolve_uncertain_activation(

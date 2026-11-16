@@ -337,22 +337,26 @@ impl<S: SandboxEffectSink> DisabledContinuationAdapter<S> {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("Continuation sandbox storage failed: {error}"))?;
-        let prior: Option<(i64, String)> = tx
+        let prior: Option<(i64, String, i64)> = tx
             .query_row(
-                "SELECT generation,material_fingerprint FROM continuation_snapshots WHERE objective_id=?1",
+                "SELECT generation,material_fingerprint,next_review_at FROM continuation_snapshots WHERE objective_id=?1",
                 [snapshot.objective_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|error| format!("Continuation sandbox storage failed: {error}"))?;
 
         let route = if prior
             .as_ref()
-            .is_some_and(|(_, prior)| prior == &fingerprint)
+            .is_some_and(|(_, prior, _)| prior == &fingerprint)
         {
+            let accepted_next_review_at = prior
+                .as_ref()
+                .map(|(_, _, next_review_at)| *next_review_at)
+                .ok_or("Accepted continuation deadline disappeared")?;
             if snapshot.lifecycle != Lifecycle::Active
                 || snapshot.stage == Stage::ObjectiveComplete
-                || trusted_now < snapshot.next_review_at
+                || trusted_now < accepted_next_review_at
             {
                 tx.commit()
                     .map_err(|error| format!("Continuation sandbox storage failed: {error}"))?;
@@ -362,7 +366,8 @@ impl<S: SandboxEffectSink> DisabledContinuationAdapter<S> {
                 .stage
                 .route()
                 .ok_or("Terminal continuation stage has no route")?;
-            let recovery_identity = recovery_identity(snapshot, &fingerprint);
+            let recovery_identity =
+                recovery_identity(snapshot, accepted_next_review_at, &fingerprint);
             let dispatch = PlannedDispatch {
                 objective_id: snapshot.objective_id.to_string(),
                 generation: snapshot.generation,
@@ -385,7 +390,7 @@ impl<S: SandboxEffectSink> DisabledContinuationAdapter<S> {
             }
             dispatch
         } else {
-            if let Some((generation, _)) = prior {
+            if let Some((generation, _, _)) = prior {
                 if snapshot.generation != generation + 1 {
                     return Err(
                         "Material continuation change must advance generation exactly once".into(),
@@ -431,13 +436,17 @@ impl<S: SandboxEffectSink> DisabledContinuationAdapter<S> {
     }
 }
 
-fn recovery_identity(snapshot: &ObjectiveSnapshot<'_>, fingerprint: &str) -> String {
+fn recovery_identity(
+    snapshot: &ObjectiveSnapshot<'_>,
+    accepted_next_review_at: i64,
+    fingerprint: &str,
+) -> String {
     let canonical = format!(
         "STALL\0{}\0{}\0{}\0{}\0{}",
         snapshot.objective_id,
         snapshot.generation,
         snapshot.stage.as_str(),
-        snapshot.next_review_at,
+        accepted_next_review_at,
         fingerprint
     );
     format!("remh-stall:{:x}", Sha256::digest(canonical.as_bytes()))

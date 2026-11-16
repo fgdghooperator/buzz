@@ -330,6 +330,15 @@ pub(super) struct ActivationResolutionInput<'a> {
     pub receipt: Option<&'a ActivationReceipt>,
 }
 
+pub(super) struct ActivationResolutionAuthorityInput<'a> {
+    pub dispatch_id: i64,
+    pub actor: &'a str,
+    pub authority_role: &'a str,
+    pub admission_reference: &'a str,
+    pub outcome: ActivationResolutionOutcome,
+    pub admitted_at: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ActivationResolutionAudit {
     pub id: i64,
@@ -495,6 +504,26 @@ impl Store {
                reason TEXT NOT NULL,
                outcome TEXT NOT NULL CHECK(outcome IN ('CONFIRMED_SENT','ABANDONED_NO_REPLAY')),
                receipt_admitted_at INTEGER,
+               FOREIGN KEY(dispatch_id) REFERENCES dispatch_outbox(id)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS activation_resolution_authority_admissions(
+               admission_reference TEXT PRIMARY KEY NOT NULL,
+               dispatch_id INTEGER NOT NULL,
+               objective_id TEXT NOT NULL,
+               generation INTEGER NOT NULL,
+               attempt INTEGER NOT NULL,
+               target_agent_key TEXT NOT NULL,
+               target_pubkey TEXT NOT NULL,
+               channel_id TEXT NOT NULL,
+               thread_root_id TEXT NOT NULL,
+               authority_digest TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL,
+               actor TEXT NOT NULL,
+               authority_role TEXT NOT NULL CHECK(authority_role IN ('OWNER','SUPERVISOR')),
+               operation TEXT NOT NULL CHECK(operation='RESOLVE_UNCERTAIN_ACTIVATION'),
+               outcome TEXT NOT NULL CHECK(outcome IN ('CONFIRMED_SENT','ABANDONED_NO_REPLAY')),
+               admitted_at INTEGER NOT NULL,
+               consumed_at INTEGER,
                FOREIGN KEY(dispatch_id) REFERENCES dispatch_outbox(id)
              ) STRICT;",
         ) {
@@ -1377,6 +1406,52 @@ impl Store {
             .ok_or("Control-plane dispatch disappeared".into())
     }
 
+    pub(super) fn admit_activation_resolution_authority(
+        &mut self,
+        input: ActivationResolutionAuthorityInput<'_>,
+    ) -> Result<()> {
+        if input.dispatch_id < 1
+            || input.actor.is_empty()
+            || input.actor.len() > 128
+            || !matches!(input.authority_role, "OWNER" | "SUPERVISOR")
+            || input.admission_reference.is_empty()
+            || input.admission_reference.len() > 512
+            || input.admitted_at < 0
+        {
+            return Err("Invalid uncertain activation authority admission".into());
+        }
+        let dispatch = self
+            .dispatch(input.dispatch_id)?
+            .ok_or("Control-plane dispatch not found")?;
+        if dispatch.state != DispatchState::VerifyBeforeRetry
+            || dispatch.recovery_state.as_deref() != Some("UNCERTAIN_WAKE_BOUNDARY")
+        {
+            return Err("Authority admission requires an uncertain activation dispatch".into());
+        }
+        let target_pubkey = dispatch
+            .target_pubkey
+            .as_deref()
+            .ok_or("Uncertain activation has no persisted pubkey")?;
+        let channel_id = dispatch
+            .channel_id
+            .as_deref()
+            .ok_or("Uncertain activation has no persisted channel")?;
+        let thread_root_id = dispatch
+            .thread_root_id
+            .as_deref()
+            .ok_or("Uncertain activation has no persisted thread root")?;
+        let idempotency_key = dispatch
+            .idempotency_key
+            .as_deref()
+            .ok_or("Uncertain activation has no persisted idempotency key")?;
+        let authority_digest = authority_digest_from_key(idempotency_key)?;
+        database(self.connection.execute(
+            "INSERT INTO activation_resolution_authority_admissions(admission_reference,dispatch_id,objective_id,generation,attempt,target_agent_key,target_pubkey,channel_id,thread_root_id,authority_digest,idempotency_key,actor,authority_role,operation,outcome,admitted_at,consumed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'RESOLVE_UNCERTAIN_ACTIVATION',?14,?15,NULL)",
+            params![input.admission_reference,dispatch.id,dispatch.objective_id,dispatch.objective_generation,dispatch.attempt,dispatch.target_agent_key,target_pubkey,channel_id,thread_root_id,authority_digest,idempotency_key,input.actor,input.authority_role,input.outcome.as_str(),input.admitted_at],
+        ))?;
+        Ok(())
+    }
+
     pub(super) fn resolve_uncertain_activation(
         &mut self,
         input: ActivationResolutionInput<'_>,
@@ -1427,6 +1502,15 @@ impl Store {
             self.connection
                 .transaction_with_behavior(TransactionBehavior::Immediate),
         )?;
+        let authority_consumed = database(tx.execute(
+            "UPDATE activation_resolution_authority_admissions SET consumed_at=?16 WHERE admission_reference=?1 AND dispatch_id=?2 AND objective_id=?3 AND generation=?4 AND attempt=?5 AND target_agent_key=?6 AND target_pubkey=?7 AND channel_id=?8 AND thread_root_id=?9 AND authority_digest=?10 AND idempotency_key=?11 AND actor=?12 AND authority_role=?13 AND operation='RESOLVE_UNCERTAIN_ACTIVATION' AND outcome=?14 AND consumed_at IS NULL AND admitted_at<=?15 AND ?15<=?16",
+            params![input.admission_reference,dispatch.id,dispatch.objective_id,dispatch.objective_generation,dispatch.attempt,dispatch.target_agent_key,dispatch.target_pubkey,dispatch.channel_id,dispatch.thread_root_id,authority_digest,idempotency_key,input.actor,input.authority_role,input.outcome.as_str(),input.decided_at,trusted_now],
+        ))?;
+        if authority_consumed != 1 {
+            return Err(
+                "Activation resolution authority is missing, mismatched, stale, or consumed".into(),
+            );
+        }
         database(tx.execute(
             "INSERT INTO activation_resolution_audits(dispatch_id,objective_id,generation,attempt,target_agent_key,target_pubkey,channel_id,thread_root_id,authority_digest,idempotency_key,actor,authority_role,admission_reference,decided_at,reason,outcome,receipt_admitted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![dispatch.id,dispatch.objective_id,dispatch.objective_generation,dispatch.attempt,dispatch.target_agent_key,dispatch.target_pubkey,dispatch.channel_id,dispatch.thread_root_id,authority_digest,idempotency_key,input.actor,input.authority_role,input.admission_reference,input.decided_at,input.reason,input.outcome.as_str(),receipt_admitted_at],
