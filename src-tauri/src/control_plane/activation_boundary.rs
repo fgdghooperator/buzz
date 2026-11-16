@@ -9,6 +9,7 @@ pub(super) struct AgentRecord {
     pub agent_key: String,
     pub pubkey: String,
     pub active: bool,
+    pub revision: String,
 }
 
 pub(super) trait AgentDirectory {
@@ -20,6 +21,7 @@ pub(super) struct CanonicalRoute {
     pub channel_id: String,
     pub thread_root_id: String,
     pub member_pubkeys: Vec<String>,
+    pub revision: String,
 }
 
 pub(super) trait RouteDirectory {
@@ -44,8 +46,18 @@ pub(super) enum AdapterResult {
     Timeout,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AdapterStatus {
+    Confirmed { admitted_at: i64 },
+    Absent,
+    Uncertain,
+    Rejected,
+}
+
 pub(super) struct ActivationPermit {
     binding: ActivationFenceBinding,
+    authority_digest: String,
+    admitted_at: i64,
 }
 
 impl ActivationPermit {
@@ -68,12 +80,22 @@ impl ActivationPermit {
     pub(super) fn thread_root_id(&self) -> &str {
         &self.binding.thread_root_id
     }
+
+    pub(super) fn authority_digest(&self) -> &str {
+        &self.authority_digest
+    }
+
+    pub(super) fn admitted_at(&self) -> i64 {
+        self.admitted_at
+    }
 }
 
 pub(super) trait ActivationAdapter {
     fn preflight(&mut self, dispatch: &Dispatch) -> std::result::Result<(), AdapterFailure>;
 
     fn admit(&mut self, permit: ActivationPermit, dispatch: &Dispatch) -> AdapterResult;
+
+    fn status(&mut self, dispatch: &Dispatch) -> Result<AdapterStatus>;
 }
 
 pub(super) fn admit_frozen<A: ActivationAdapter>(
@@ -81,13 +103,18 @@ pub(super) fn admit_frozen<A: ActivationAdapter>(
     adapter: &mut A,
     frozen: &Dispatch,
     admission_at: i64,
+    authority_digest: &str,
 ) -> Result<(Dispatch, Option<AdapterResult>)> {
     let binding = fence_binding(frozen)?;
     let Some(binding) = store.consume_activation_fence(&binding, admission_at)? else {
         store.block_activation_fence_if_invalid(&binding, admission_at, false)?;
         return Ok((fresh_dispatch(store, frozen.id)?, None));
     };
-    let permit = ActivationPermit { binding };
+    let permit = ActivationPermit {
+        binding,
+        authority_digest: authority_digest.to_string(),
+        admitted_at: admission_at,
+    };
     let result = adapter.admit(permit, frozen);
     Ok((fresh_dispatch(store, frozen.id)?, Some(result)))
 }
@@ -154,6 +181,24 @@ where
         self.store.recover_expired_activation_claims(now)
     }
 
+    pub(super) fn reconcile_quarantined(&mut self, dispatch_id: i64) -> Result<Dispatch> {
+        let dispatch = fresh_dispatch(&self.store, dispatch_id)?;
+        if dispatch.state != DispatchState::VerifyBeforeRetry
+            || dispatch.recovery_state.as_deref() != Some("UNCERTAIN_WAKE_BOUNDARY")
+        {
+            return Err("Activation dispatch is not quarantined for reconciliation".into());
+        }
+        let idempotency_key = dispatch
+            .idempotency_key
+            .clone()
+            .ok_or("Quarantined activation dispatch has no idempotency key")?;
+        let AdapterStatus::Confirmed { admitted_at } = self.adapter.status(&dispatch)? else {
+            return Ok(dispatch);
+        };
+        self.store
+            .record_reconciled_activation_sent(dispatch_id, &idempotency_key, admitted_at)
+    }
+
     pub(super) fn coordinate(
         &mut self,
         objective_id: &str,
@@ -167,6 +212,12 @@ where
         }
         if objective.state != ObjectiveState::Active {
             return Ok(ActivationOutcome::Silent(SilentReason::Dormant));
+        }
+        if self
+            .store
+            .has_unresolved_prior_activation(objective_id, expected_generation)?
+        {
+            return Ok(ActivationOutcome::Silent(SilentReason::AlreadyIntervened));
         }
 
         let pending = self
@@ -254,6 +305,7 @@ where
                 return Ok(ActivationOutcome::Rejected(released));
             }
         };
+        let authority_digest = authority_revision(&second);
         let idempotency_key = deterministic_idempotency_key(&dispatch, &second);
         let frozen = match self.store.record_activation_wake_intent(
             dispatch.id,
@@ -281,36 +333,13 @@ where
                 )?));
             }
         };
-        let live = match self.resolve_authority(objective_id, &objective.owner_agent) {
-            Ok(authority) if authority == second => authority,
-            _ => {
-                self.store.block_activation_fence_if_invalid(
-                    &fence_binding(&frozen)?,
-                    admission_at,
-                    true,
-                )?;
-                return Ok(ActivationOutcome::Uncertain(
-                    self.store
-                        .dispatch(frozen.id)?
-                        .ok_or("Control-plane dispatch disappeared")?,
-                ));
-            }
-        };
-        let binding = fence_binding(&frozen)?;
-        if binding.target_agent_key != live.agent.agent_key
-            || binding.target_pubkey != live.agent.pubkey
-            || binding.channel_id != live.route.channel_id
-            || binding.thread_root_id != live.route.thread_root_id
-        {
-            self.store
-                .block_activation_fence_if_invalid(&binding, admission_at, true)?;
-            return Ok(ActivationOutcome::Uncertain(fresh_dispatch(
-                &self.store,
-                frozen.id,
-            )?));
-        }
-        let (post_fence, adapter_result) =
-            admit_frozen(&mut self.store, &mut self.adapter, &frozen, admission_at)?;
+        let (post_fence, adapter_result) = admit_frozen(
+            &mut self.store,
+            &mut self.adapter,
+            &frozen,
+            admission_at,
+            &authority_digest,
+        )?;
         match adapter_result {
             Some(AdapterResult::Admitted) => {
                 let sent_at = match self.trusted_time(Some(admission_at)) {
@@ -347,7 +376,12 @@ where
             return Err("Canonical activation agent is missing or ambiguous".into());
         }
         let agent = records.into_iter().next().unwrap();
-        if !agent.active || agent.agent_key != owner_agent || !hex64(&agent.pubkey) {
+        if !agent.active
+            || agent.agent_key != owner_agent
+            || !hex64(&agent.pubkey)
+            || agent.revision.is_empty()
+            || agent.revision.len() > 256
+        {
             return Err("Canonical activation agent is inactive or mismatched".into());
         }
         let routes = self.routes.routes_for(objective_id)?;
@@ -357,6 +391,8 @@ where
         let route = routes.into_iter().next().unwrap();
         if uuid::Uuid::parse_str(&route.channel_id).is_err()
             || !hex64(&route.thread_root_id)
+            || route.revision.is_empty()
+            || route.revision.len() > 256
             || !route
                 .member_pubkeys
                 .iter()
@@ -404,6 +440,7 @@ pub(super) fn fence_binding(dispatch: &Dispatch) -> Result<ActivationFenceBindin
 }
 
 fn deterministic_idempotency_key(dispatch: &Dispatch, authority: &Authority) -> String {
+    let authority_revision = authority_revision(authority);
     let mut digest = Sha256::new();
     for value in [
         dispatch.objective_id.as_str(),
@@ -412,11 +449,38 @@ fn deterministic_idempotency_key(dispatch: &Dispatch, authority: &Authority) -> 
         authority.agent.pubkey.as_str(),
         authority.route.channel_id.as_str(),
         authority.route.thread_root_id.as_str(),
+        authority_revision.as_str(),
     ] {
         digest.update(value.as_bytes());
         digest.update([0]);
     }
-    format!("remh-oi:{:x}", digest.finalize())
+    format!("remh-oi:{authority_revision}:{:x}", digest.finalize())
+}
+
+fn authority_revision(authority: &Authority) -> String {
+    let mut members = authority.route.member_pubkeys.clone();
+    members.sort();
+    let mut digest = Sha256::new();
+    for value in [
+        authority.agent.agent_key.as_str(),
+        authority.agent.pubkey.as_str(),
+        authority.agent.revision.as_str(),
+        authority.route.channel_id.as_str(),
+        authority.route.thread_root_id.as_str(),
+        authority.route.revision.as_str(),
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    for member in members {
+        digest.update(member.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+pub(super) fn authority_revision_for(agent: AgentRecord, route: CanonicalRoute) -> String {
+    authority_revision(&Authority { agent, route })
 }
 
 fn hex64(value: &str) -> bool {

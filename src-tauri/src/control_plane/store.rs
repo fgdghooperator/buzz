@@ -825,6 +825,15 @@ impl Store {
             database(tx.commit())?;
             return Ok(Evaluation::Silent(SilentReason::ProviderCircuitOpen));
         }
+        let unresolved_activation = database(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_outbox WHERE objective_id=?1 AND idempotency_key IS NOT NULL AND state NOT IN ('SENT','ACKED') AND (recovery_state GLOB 'FENCE_*' OR recovery_state='UNCERTAIN_WAKE_BOUNDARY'))",
+            [objective_id],
+            |row| row.get::<_, bool>(0),
+        ))?;
+        if unresolved_activation {
+            database(tx.commit())?;
+            return Ok(Evaluation::Silent(SilentReason::AlreadyIntervened));
+        }
         let inserted = database(tx.execute(
             "INSERT OR IGNORE INTO dispatch_outbox(objective_id,objective_generation,attempt,state,target_agent_key,created_at,updated_at) VALUES (?1,?2,1,'PENDING',?3,?4,?4)",
             params![objective_id,expected_generation,agent_key,now],
@@ -887,6 +896,18 @@ impl Store {
                 )
                 .optional(),
         )
+    }
+
+    pub(super) fn has_unresolved_prior_activation(
+        &self,
+        objective_id: &str,
+        generation: i64,
+    ) -> Result<bool> {
+        database(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_outbox WHERE objective_id=?1 AND objective_generation<?2 AND idempotency_key IS NOT NULL AND state NOT IN ('SENT','ACKED') AND (recovery_state GLOB 'FENCE_*' OR recovery_state='UNCERTAIN_WAKE_BOUNDARY'))",
+            params![objective_id, generation],
+            |row| row.get(0),
+        ))
     }
 
     pub(super) fn dispatches(&self, objective_id: &str) -> Result<Vec<Dispatch>> {
@@ -1200,11 +1221,29 @@ impl Store {
     ) -> Result<Dispatch> {
         let spent = format!("FENCE_SPENT:{idempotency_key}");
         let changed = database(self.connection.execute(
-            "UPDATE dispatch_outbox SET state='SENT',sent_at=?3,updated_at=?3 WHERE id=?1 AND state='WAKE_INTENT' AND idempotency_key=?2 AND recovery_state=?4 AND wake_intent_at<?3",
+            "UPDATE dispatch_outbox SET state='SENT',sent_at=?3,updated_at=MAX(updated_at,?3) WHERE id=?1 AND state='WAKE_INTENT' AND idempotency_key=?2 AND recovery_state=?4 AND wake_intent_at<=?3",
             params![dispatch_id,idempotency_key,sent_at,spent],
         ))?;
         if changed != 1 {
             return Err("Only a spent activation fence may be marked SENT".into());
+        }
+        self.dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch disappeared".into())
+    }
+
+    pub(super) fn record_reconciled_activation_sent(
+        &mut self,
+        dispatch_id: i64,
+        idempotency_key: &str,
+        sent_at: i64,
+    ) -> Result<Dispatch> {
+        let spent = format!("FENCE_SPENT:{idempotency_key}");
+        let changed = database(self.connection.execute(
+            "UPDATE dispatch_outbox SET state='SENT',sent_at=?3,recovery_state=?4,updated_at=MAX(updated_at,?3) WHERE id=?1 AND state='VERIFY_BEFORE_RETRY' AND recovery_state='UNCERTAIN_WAKE_BOUNDARY' AND idempotency_key=?2 AND wake_intent_at<=?3",
+            params![dispatch_id,idempotency_key,sent_at,spent],
+        ))?;
+        if changed != 1 {
+            return Err("Confirmed activation admission could not be reconciled".into());
         }
         self.dispatch(dispatch_id)?
             .ok_or("Control-plane dispatch disappeared".into())

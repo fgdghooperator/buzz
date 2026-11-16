@@ -1,6 +1,7 @@
 use super::activation_boundary::{
-    admit_frozen, ActivationAdapter, ActivationBoundary, ActivationOutcome, AdapterFailure,
-    AdapterResult, AgentDirectory, AgentRecord, CanonicalRoute, RouteDirectory, TrustedClock,
+    admit_frozen, authority_revision_for, ActivationAdapter, ActivationBoundary, ActivationOutcome,
+    AdapterFailure, AdapterResult, AdapterStatus, AgentDirectory, AgentRecord, CanonicalRoute,
+    RouteDirectory, TrustedClock,
 };
 use super::coordinator::{
     Coordination, Coordinator, DispatchFailure, WakeAdapter, WakeAdmission, WakeTarget,
@@ -10,7 +11,7 @@ use super::store::{
     HumanAuthorityAdmissionInput, NewObjective, ObjectiveState, ProofInput, ProofKind,
     SignedAckEvent, SilentReason, SmokePrepareInput, Store, WakeIntentInput,
 };
-use rusqlite::types::Value;
+use rusqlite::{params, types::Value, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::VecDeque;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
@@ -3353,17 +3354,6 @@ fn coordinator_idempotency_key_is_deterministic_from_stable_dispatch_fields() {
 }
 
 #[derive(Clone)]
-struct TestAgentDirectory {
-    records: Vec<AgentRecord>,
-}
-
-impl AgentDirectory for TestAgentDirectory {
-    fn records_for(&mut self, _agent_key: &str) -> super::store::Result<Vec<AgentRecord>> {
-        Ok(self.records.clone())
-    }
-}
-
-#[derive(Clone)]
 struct TestRouteDirectory {
     routes: Vec<CanonicalRoute>,
 }
@@ -3371,6 +3361,34 @@ struct TestRouteDirectory {
 impl RouteDirectory for TestRouteDirectory {
     fn routes_for(&mut self, _objective_id: &str) -> super::store::Result<Vec<CanonicalRoute>> {
         Ok(self.routes.clone())
+    }
+}
+
+#[derive(Clone)]
+struct LiveAuthoritySource {
+    agents: Vec<AgentRecord>,
+    routes: Vec<CanonicalRoute>,
+}
+
+#[derive(Clone)]
+struct SharedAgentDirectory {
+    source: Arc<Mutex<LiveAuthoritySource>>,
+}
+
+impl AgentDirectory for SharedAgentDirectory {
+    fn records_for(&mut self, _agent_key: &str) -> super::store::Result<Vec<AgentRecord>> {
+        Ok(self.source.lock().unwrap().agents.clone())
+    }
+}
+
+#[derive(Clone)]
+struct SharedRouteDirectory {
+    source: Arc<Mutex<LiveAuthoritySource>>,
+}
+
+impl RouteDirectory for SharedRouteDirectory {
+    fn routes_for(&mut self, _objective_id: &str) -> super::store::Result<Vec<CanonicalRoute>> {
+        Ok(self.source.lock().unwrap().routes.clone())
     }
 }
 
@@ -3415,6 +3433,88 @@ struct TestActivationAdapter {
     state: Arc<Mutex<BoundaryAdapterState>>,
     preflight_failure: Option<AdapterFailure>,
     behavior: BoundaryBehavior,
+    path: std::path::PathBuf,
+    authority: Arc<Mutex<LiveAuthoritySource>>,
+    drift_revisions: Option<(Option<String>, Option<String>)>,
+}
+
+impl TestActivationAdapter {
+    fn new(
+        path: std::path::PathBuf,
+        state: Arc<Mutex<BoundaryAdapterState>>,
+        behavior: BoundaryBehavior,
+        authority: Arc<Mutex<LiveAuthoritySource>>,
+    ) -> Self {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS test_activation_effects(idempotency_key TEXT PRIMARY KEY,authority_digest TEXT NOT NULL,target_pubkey TEXT NOT NULL,channel_id TEXT NOT NULL,thread_root_id TEXT NOT NULL,admitted_at INTEGER NOT NULL,status TEXT NOT NULL);",
+            )
+            .unwrap();
+        Self {
+            state,
+            preflight_failure: None,
+            behavior,
+            path,
+            authority,
+            drift_revisions: None,
+        }
+    }
+
+    fn drift_authority_before_effect(
+        &mut self,
+        agent_revision: Option<&str>,
+        route_revision: Option<&str>,
+    ) {
+        self.drift_revisions = Some((
+            agent_revision.map(str::to_string),
+            route_revision.map(str::to_string),
+        ));
+    }
+
+    fn durable_effect_count(&self) -> usize {
+        let count: i64 = Connection::open(&self.path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM test_activation_effects", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        count.try_into().unwrap()
+    }
+
+    fn mutate_live_authority_now(
+        &self,
+        agent_revision: Option<&str>,
+        route_revision: Option<&str>,
+    ) {
+        let mut authority = self.authority.lock().unwrap();
+        if let (Some(revision), Some(agent)) = (agent_revision, authority.agents.first_mut()) {
+            agent.revision = revision.to_string();
+        }
+        if let (Some(revision), Some(route)) = (route_revision, authority.routes.first_mut()) {
+            route.revision = revision.to_string();
+        }
+    }
+
+    fn duplicate_effect_by_key(&self, idempotency_key: &str) -> usize {
+        Connection::open(&self.path)
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO test_activation_effects(idempotency_key,authority_digest,target_pubkey,channel_id,thread_root_id,admitted_at,status) SELECT idempotency_key,authority_digest,target_pubkey,channel_id,thread_root_id,admitted_at,status FROM test_activation_effects WHERE idempotency_key=?1",
+                [idempotency_key],
+            )
+            .unwrap()
+    }
+
+    fn corrupt_receipt_digest(&self, idempotency_key: &str) {
+        Connection::open(&self.path)
+            .unwrap()
+            .execute(
+                "UPDATE test_activation_effects SET authority_digest='mismatched-receipt' WHERE idempotency_key=?1",
+                [idempotency_key],
+            )
+            .unwrap();
+    }
 }
 
 impl ActivationAdapter for TestActivationAdapter {
@@ -3434,6 +3534,60 @@ impl ActivationAdapter for TestActivationAdapter {
         if matches!(self.behavior, BoundaryBehavior::PanicBeforeExternalCall) {
             panic!("simulated crash before external fake call");
         }
+        let mut authority = self.authority.lock().unwrap();
+        if let Some((agent_revision, route_revision)) = self.drift_revisions.take() {
+            if let (Some(revision), Some(agent)) = (agent_revision, authority.agents.first_mut()) {
+                agent.revision = revision;
+            }
+            if let (Some(revision), Some(route)) = (route_revision, authority.routes.first_mut()) {
+                route.revision = revision;
+            }
+        }
+        let mut connection = Connection::open(&self.path).unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let existing: Option<(String, String, String, String, i64, String)> = transaction
+            .query_row(
+                "SELECT authority_digest,target_pubkey,channel_id,thread_root_id,admitted_at,status FROM test_activation_effects WHERE idempotency_key=?1",
+                [permit.idempotency_key()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            )
+            .optional()
+            .unwrap();
+        if let Some((digest, pubkey, channel, thread, _, status)) = existing {
+            let matches = digest == permit.authority_digest()
+                && pubkey == permit.pubkey()
+                && channel == permit.channel_id()
+                && thread == permit.thread_root_id();
+            transaction.commit().unwrap();
+            return if matches && status == "CONFIRMED" {
+                AdapterResult::Admitted
+            } else {
+                AdapterResult::Rejected
+            };
+        }
+        let live = authority
+            .agents
+            .first()
+            .cloned()
+            .zip(authority.routes.first().cloned())
+            .filter(|_| authority.agents.len() == 1 && authority.routes.len() == 1);
+        let live_matches = live.is_some_and(|(agent, route)| {
+            authority_revision_for(agent.clone(), route.clone()) == permit.authority_digest()
+                && agent.agent_key == dispatch.target_agent_key
+                && dispatch.target_pubkey.as_deref() == Some(agent.pubkey.as_str())
+                && dispatch.channel_id.as_deref() == Some(route.channel_id.as_str())
+                && dispatch.thread_root_id.as_deref() == Some(route.thread_root_id.as_str())
+                && route
+                    .member_pubkeys
+                    .iter()
+                    .any(|member| member == &agent.pubkey)
+        });
+        if !live_matches {
+            transaction.commit().unwrap();
+            return AdapterResult::Rejected;
+        }
         let mut state = self.state.lock().unwrap();
         state.admissions += 1;
         state.permits.push((
@@ -3445,6 +3599,18 @@ impl ActivationAdapter for TestActivationAdapter {
         ));
         assert_eq!(permit.dispatch_id(), dispatch.id);
         drop(state);
+        if matches!(
+            self.behavior,
+            BoundaryBehavior::Admitted | BoundaryBehavior::PanicAfterExternalCall
+        ) {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO test_activation_effects(idempotency_key,authority_digest,target_pubkey,channel_id,thread_root_id,admitted_at,status) VALUES(?1,?2,?3,?4,?5,?6,'CONFIRMED')",
+                    params![permit.idempotency_key(),permit.authority_digest(),permit.pubkey(),permit.channel_id(),permit.thread_root_id(),permit.admitted_at()],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
         match self.behavior {
             BoundaryBehavior::Admitted => AdapterResult::Admitted,
             BoundaryBehavior::Rejected => AdapterResult::Rejected,
@@ -3456,6 +3622,35 @@ impl ActivationAdapter for TestActivationAdapter {
             BoundaryBehavior::PanicBeforeExternalCall => unreachable!(),
         }
     }
+
+    fn status(&mut self, dispatch: &super::store::Dispatch) -> super::store::Result<AdapterStatus> {
+        let key = dispatch
+            .idempotency_key
+            .as_deref()
+            .ok_or("Activation status lookup requires an idempotency key")?;
+        let receipt: Option<(String, String, String, String, i64, String)> = Connection::open(&self.path)
+            .map_err(|error| format!("Test activation adapter failed: {error}"))?
+            .query_row(
+                "SELECT authority_digest,target_pubkey,channel_id,thread_root_id,admitted_at,status FROM test_activation_effects WHERE idempotency_key=?1",
+                [key],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Test activation adapter failed: {error}"))?;
+        let Some((digest, pubkey, channel, thread, admitted_at, status)) = receipt else {
+            return Ok(AdapterStatus::Uncertain);
+        };
+        let matching = key.starts_with(&format!("remh-oi:{digest}:"))
+            && dispatch.target_pubkey.as_deref() == Some(pubkey.as_str())
+            && dispatch.channel_id.as_deref() == Some(channel.as_str())
+            && dispatch.thread_root_id.as_deref() == Some(thread.as_str());
+        Ok(match (matching, status.as_str()) {
+            (true, "CONFIRMED") => AdapterStatus::Confirmed { admitted_at },
+            (true, "ABSENT") => AdapterStatus::Absent,
+            (true, "REJECTED") => AdapterStatus::Rejected,
+            _ => AdapterStatus::Uncertain,
+        })
+    }
 }
 
 fn boundary_agent_records() -> Vec<AgentRecord> {
@@ -3463,6 +3658,7 @@ fn boundary_agent_records() -> Vec<AgentRecord> {
         agent_key: "fgd-smoke-agent".into(),
         pubkey: TARGET_PUBKEY.into(),
         active: true,
+        revision: "agent-revision-1".into(),
     }]
 }
 
@@ -3471,6 +3667,7 @@ fn boundary_routes() -> Vec<CanonicalRoute> {
         channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0".into(),
         thread_root_id: THREAD_ROOT.into(),
         member_pubkeys: vec![TARGET_PUBKEY.into()],
+        revision: "route-revision-1".into(),
     }]
 }
 
@@ -3482,7 +3679,12 @@ fn activation_boundary_for(
     times: impl IntoIterator<Item = i64>,
     behavior: BoundaryBehavior,
 ) -> (
-    ActivationBoundary<TestAgentDirectory, TestRouteDirectory, TestClock, TestActivationAdapter>,
+    ActivationBoundary<
+        SharedAgentDirectory,
+        SharedRouteDirectory,
+        TestClock,
+        TestActivationAdapter,
+    >,
     Arc<Mutex<BoundaryAdapterState>>,
 ) {
     let mut store = Store::open(path.to_path_buf()).unwrap();
@@ -3492,16 +3694,20 @@ fn activation_boundary_for(
             .unwrap();
     }
     let state = Arc::new(Mutex::new(BoundaryAdapterState::default()));
-    let adapter = TestActivationAdapter {
-        state: state.clone(),
-        preflight_failure: None,
+    let authority = Arc::new(Mutex::new(LiveAuthoritySource { agents, routes }));
+    let adapter = TestActivationAdapter::new(
+        path.to_path_buf(),
+        state.clone(),
         behavior,
-    };
+        authority.clone(),
+    );
     (
         ActivationBoundary::new(
             store,
-            TestAgentDirectory { records: agents },
-            TestRouteDirectory { routes },
+            SharedAgentDirectory {
+                source: authority.clone(),
+            },
+            SharedRouteDirectory { source: authority },
             TestClock::new(times),
             adapter,
             "activation-boundary-test",
@@ -3790,14 +3996,18 @@ fn exactly_one_contender_consumes_the_durable_activation_fence() {
         let frozen = frozen.clone();
         let state = state.clone();
         handles.push(std::thread::spawn(move || {
-            let mut store = Store::open(path).unwrap();
-            let mut adapter = TestActivationAdapter {
-                state,
-                preflight_failure: None,
-                behavior: BoundaryBehavior::Rejected,
-            };
+            let mut store = Store::open(path.clone()).unwrap();
+            let agent = boundary_agent_records().remove(0);
+            let route = boundary_routes().remove(0);
+            let revision = authority_revision_for(agent.clone(), route.clone());
+            let authority = Arc::new(Mutex::new(LiveAuthoritySource {
+                agents: vec![agent],
+                routes: vec![route],
+            }));
+            let mut adapter =
+                TestActivationAdapter::new(path, state, BoundaryBehavior::Rejected, authority);
             barrier.wait();
-            admit_frozen(&mut store, &mut adapter, &frozen, 303).unwrap()
+            admit_frozen(&mut store, &mut adapter, &frozen, 303, &revision).unwrap()
         }));
     }
     barrier.wait();
@@ -3856,6 +4066,243 @@ fn activation_boundary_crash_points_are_uncertain_and_never_replayed() {
             Evaluation::Silent(SilentReason::AlreadyIntervened)
         );
     }
+}
+
+#[test]
+fn activation_adapter_boundary_rechecks_persisted_authority_revision_before_effect() {
+    for (name, agent_revision, route_revision, expected_effects) in [
+        ("stable", None, None, 1),
+        ("agent-drift", Some("agent-revision-2"), None, 0),
+        ("route-drift", None, Some("route-revision-2"), 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-ACTIVATE-AUTHORITY-{name}");
+        let (mut boundary, state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            boundary_agent_records(),
+            boundary_routes(),
+            [300, 301, 302, 303],
+            BoundaryBehavior::Admitted,
+        );
+        if agent_revision.is_some() || route_revision.is_some() {
+            boundary
+                .adapter_mut()
+                .drift_authority_before_effect(agent_revision, route_revision);
+        }
+
+        let outcome = boundary.coordinate(&objective_id, 1).unwrap();
+        let dispatch = match (expected_effects, outcome) {
+            (1, ActivationOutcome::Sent(dispatch)) => dispatch,
+            (0, ActivationOutcome::Uncertain(dispatch)) => dispatch,
+            (_, other) => panic!("unexpected authority outcome for {name}: {other:?}"),
+        };
+        assert_eq!(
+            boundary.adapter_mut().durable_effect_count(),
+            expected_effects
+        );
+        assert_eq!(state.lock().unwrap().admissions, expected_effects);
+        if expected_effects == 1 {
+            let key = dispatch.idempotency_key.as_deref().unwrap();
+            boundary
+                .adapter_mut()
+                .mutate_live_authority_now(Some("agent-revision-after-effect"), None);
+            assert_eq!(boundary.adapter_mut().duplicate_effect_by_key(key), 0);
+            assert_eq!(boundary.adapter_mut().durable_effect_count(), 1);
+        } else {
+            assert_eq!(dispatch.state, DispatchState::WakeIntent);
+            assert!(dispatch
+                .recovery_state
+                .as_deref()
+                .is_some_and(|value| value.starts_with("FENCE_SPENT:")));
+        }
+    }
+}
+
+#[test]
+fn activation_equal_trusted_timestamps_persist_sent_without_ambiguity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let (mut boundary, state) = activation_boundary_for(
+        &path,
+        "REMH-ACTIVATE-EQUAL-TIME",
+        boundary_agent_records(),
+        boundary_routes(),
+        [300, 300, 300, 300],
+        BoundaryBehavior::Admitted,
+    );
+
+    let sent = match boundary.coordinate("REMH-ACTIVATE-EQUAL-TIME", 1).unwrap() {
+        ActivationOutcome::Sent(dispatch) => dispatch,
+        other => panic!("expected equal-time SENT, got {other:?}"),
+    };
+    assert_eq!(sent.wake_intent_at, Some(300));
+    assert_eq!(sent.sent_at, Some(300));
+    assert_eq!(state.lock().unwrap().admissions, 1);
+    assert_eq!(boundary.adapter_mut().durable_effect_count(), 1);
+}
+
+#[test]
+fn activation_post_consume_reconciliation_queries_by_key_without_replay() {
+    for (name, behavior, expected_admissions, expected_effects, expected_state, corrupt_receipt) in [
+        (
+            "before-call-crash",
+            BoundaryBehavior::PanicBeforeExternalCall,
+            0,
+            0,
+            DispatchState::VerifyBeforeRetry,
+            false,
+        ),
+        (
+            "admitted-crash",
+            BoundaryBehavior::PanicAfterExternalCall,
+            1,
+            1,
+            DispatchState::Sent,
+            false,
+        ),
+        (
+            "mismatched-receipt",
+            BoundaryBehavior::PanicAfterExternalCall,
+            1,
+            1,
+            DispatchState::VerifyBeforeRetry,
+            true,
+        ),
+        (
+            "uncertain",
+            BoundaryBehavior::Timeout,
+            1,
+            0,
+            DispatchState::VerifyBeforeRetry,
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-ACTIVATE-RECONCILE-{name}");
+        let (mut boundary, state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            boundary_agent_records(),
+            boundary_routes(),
+            [300, 301, 302],
+            behavior,
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boundary.coordinate(&objective_id, 1)
+        }));
+        if matches!(
+            behavior,
+            BoundaryBehavior::PanicBeforeExternalCall | BoundaryBehavior::PanicAfterExternalCall
+        ) {
+            assert!(outcome.is_err());
+        } else {
+            assert!(matches!(
+                outcome.unwrap().unwrap(),
+                ActivationOutcome::Uncertain(_)
+            ));
+        }
+        assert_eq!(state.lock().unwrap().admissions, expected_admissions);
+        assert_eq!(
+            boundary.adapter_mut().durable_effect_count(),
+            expected_effects
+        );
+        let before = boundary
+            .store()
+            .dispatches(&objective_id)
+            .unwrap()
+            .remove(0);
+        let key = before.idempotency_key.clone().unwrap();
+        let target = before.target_pubkey.clone();
+        let channel = before.channel_id.clone();
+        let thread = before.thread_root_id.clone();
+        if corrupt_receipt {
+            boundary.adapter_mut().corrupt_receipt_digest(&key);
+        }
+        drop(boundary);
+
+        let mut reopened = Store::open(path.clone()).unwrap();
+        reopened
+            .reconcile_activation_startup("relay", "1", &[], 1_000, 900)
+            .unwrap();
+        drop(reopened);
+
+        let (mut restarted, restarted_state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            boundary_agent_records(),
+            boundary_routes(),
+            [1_001],
+            BoundaryBehavior::Admitted,
+        );
+        let reconciled = restarted.reconcile_quarantined(before.id).unwrap();
+        assert_eq!(reconciled.state, expected_state);
+        assert_eq!(reconciled.attempt, 1);
+        assert_eq!(reconciled.idempotency_key.as_deref(), Some(key.as_str()));
+        assert_eq!(reconciled.target_pubkey, target);
+        assert_eq!(reconciled.channel_id, channel);
+        assert_eq!(reconciled.thread_root_id, thread);
+        assert_eq!(restarted_state.lock().unwrap().admissions, 0);
+        assert_eq!(
+            restarted.adapter_mut().durable_effect_count(),
+            expected_effects
+        );
+    }
+}
+
+#[test]
+fn unresolved_activation_key_blocks_later_generation_key_minting() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let objective_id = "REMH-ACTIVATE-UNRESOLVED-GENERATION";
+    let (mut boundary, _) = activation_boundary_for(
+        &path,
+        objective_id,
+        boundary_agent_records(),
+        boundary_routes(),
+        [300, 301, 302],
+        BoundaryBehavior::Timeout,
+    );
+    let unresolved = match boundary.coordinate(objective_id, 1).unwrap() {
+        ActivationOutcome::Uncertain(dispatch) => dispatch,
+        other => panic!("expected unresolved activation, got {other:?}"),
+    };
+    let original_key = unresolved.idempotency_key.clone().unwrap();
+    assert_eq!(boundary.adapter_mut().durable_effect_count(), 0);
+    drop(boundary);
+
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .record_verified_progress(proof(objective_id, 400, 500))
+        .unwrap();
+    assert_eq!(
+        store.objective(objective_id).unwrap().unwrap().generation,
+        2
+    );
+    drop(store);
+
+    let (mut later, state) = activation_boundary_for(
+        &path,
+        objective_id,
+        boundary_agent_records(),
+        boundary_routes(),
+        [500],
+        BoundaryBehavior::Admitted,
+    );
+    assert_eq!(
+        later.coordinate(objective_id, 2).unwrap(),
+        ActivationOutcome::Silent(SilentReason::AlreadyIntervened)
+    );
+    let dispatches = later.store().dispatches(objective_id).unwrap();
+    assert_eq!(dispatches.len(), 1);
+    assert_eq!(
+        dispatches[0].idempotency_key.as_deref(),
+        Some(original_key.as_str())
+    );
+    assert_eq!(state.lock().unwrap().admissions, 0);
+    assert_eq!(later.adapter_mut().durable_effect_count(), 0);
 }
 
 #[test]
@@ -4138,19 +4585,6 @@ impl AgentDirectory for ScriptedAgentDirectory {
     }
 }
 
-#[derive(Clone)]
-struct ScriptedRouteDirectory {
-    routes: VecDeque<Vec<CanonicalRoute>>,
-}
-
-impl RouteDirectory for ScriptedRouteDirectory {
-    fn routes_for(&mut self, _objective_id: &str) -> super::store::Result<Vec<CanonicalRoute>> {
-        self.routes
-            .pop_front()
-            .ok_or_else(|| "scripted route directory exhausted".into())
-    }
-}
-
 #[test]
 fn activation_claim_recovery_and_release_are_isolated_from_legacy_claims() {
     let dir = tempfile::tempdir().unwrap();
@@ -4241,6 +4675,10 @@ fn activation_pre_freeze_release_is_guarded_and_preclaim_failure_preserves_pendi
 
     let store = Store::open(path.clone()).unwrap();
     let state = Arc::new(Mutex::new(BoundaryAdapterState::default()));
+    let adapter_authority = Arc::new(Mutex::new(LiveAuthoritySource {
+        agents: boundary_agent_records(),
+        routes: boundary_routes(),
+    }));
     let mut boundary = ActivationBoundary::new(
         store,
         ScriptedAgentDirectory {
@@ -4256,11 +4694,12 @@ fn activation_pre_freeze_release_is_guarded_and_preclaim_failure_preserves_pendi
             routes: boundary_routes(),
         },
         TestClock::new([302, 303]),
-        TestActivationAdapter {
+        TestActivationAdapter::new(
+            path.clone(),
             state,
-            preflight_failure: None,
-            behavior: BoundaryBehavior::Admitted,
-        },
+            BoundaryBehavior::Admitted,
+            adapter_authority,
+        ),
         "release-holder",
     );
     let released = match boundary.coordinate("REMH-PRECLAIM-PENDING", 1).unwrap() {
@@ -4273,42 +4712,51 @@ fn activation_pre_freeze_release_is_guarded_and_preclaim_failure_preserves_pendi
 }
 
 #[test]
-fn final_route_mismatch_returns_fresh_blocked_row() {
+fn adapter_route_revision_drift_returns_fresh_spent_row_without_effect() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("control-plane.sqlite3");
-    let mut changed_route = boundary_routes()[0].clone();
-    changed_route.thread_root_id = OTHER_ROOT.into();
-    let state = Arc::new(Mutex::new(BoundaryAdapterState::default()));
-    let mut store = Store::open(path.clone()).unwrap();
-    store
-        .create_active(active("REMH-FINAL-ROUTE", "fgd-smoke-agent", 100, 200))
-        .unwrap();
-    let mut boundary = ActivationBoundary::new(
-        store,
-        TestAgentDirectory {
-            records: boundary_agent_records(),
-        },
-        ScriptedRouteDirectory {
-            routes: VecDeque::from([boundary_routes(), boundary_routes(), vec![changed_route]]),
-        },
-        TestClock::new([300, 301, 302]),
-        TestActivationAdapter {
-            state: state.clone(),
-            preflight_failure: None,
-            behavior: BoundaryBehavior::Admitted,
-        },
-        "route-holder",
+    let (mut boundary, state) = activation_boundary_for(
+        &path,
+        "REMH-FINAL-ROUTE",
+        boundary_agent_records(),
+        boundary_routes(),
+        [300, 301, 302],
+        BoundaryBehavior::Admitted,
     );
+    boundary
+        .adapter_mut()
+        .drift_authority_before_effect(None, Some("route-revision-2"));
     let blocked = match boundary.coordinate("REMH-FINAL-ROUTE", 1).unwrap() {
         ActivationOutcome::Uncertain(dispatch) => dispatch,
         other => panic!("expected blocked uncertainty, got {other:?}"),
     };
     let expected = format!(
-        "FENCE_BLOCKED:{}",
+        "FENCE_SPENT:{}",
         blocked.idempotency_key.as_deref().unwrap()
     );
     assert_eq!(blocked.recovery_state.as_deref(), Some(expected.as_str()));
     assert_eq!(state.lock().unwrap().admissions, 0);
+    assert_eq!(boundary.adapter_mut().durable_effect_count(), 0);
+    let dispatch_id = blocked.id;
+    drop(boundary);
+
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .reconcile_activation_startup("relay", "1", &[], 1_000, 900)
+        .unwrap();
+    drop(store);
+    let (mut restarted, restarted_state) = activation_boundary_for(
+        &path,
+        "REMH-FINAL-ROUTE",
+        boundary_agent_records(),
+        boundary_routes(),
+        [1_001],
+        BoundaryBehavior::Admitted,
+    );
+    let reconciled = restarted.reconcile_quarantined(dispatch_id).unwrap();
+    assert_eq!(reconciled.state, DispatchState::VerifyBeforeRetry);
+    assert_eq!(restarted_state.lock().unwrap().admissions, 0);
+    assert_eq!(restarted.adapter_mut().durable_effect_count(), 0);
 }
 
 #[test]
