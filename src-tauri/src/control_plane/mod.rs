@@ -1,3 +1,4 @@
+mod coordinator;
 mod store;
 
 #[cfg(test)]

@@ -1,10 +1,14 @@
+use super::coordinator::{
+    Coordination, Coordinator, DispatchFailure, WakeAdapter, WakeAdmission, WakeTarget,
+};
 use super::store::{
     AckOutcome, BlockerInput, BlockerRoute, DispatchState, Evaluation,
     HumanAuthorityAdmissionInput, NewObjective, ObjectiveState, ProofInput, ProofKind,
     SignedAckEvent, SilentReason, SmokePrepareInput, Store, WakeIntentInput,
 };
 use rusqlite::types::Value;
-use std::sync::{Arc, Barrier};
+use std::collections::VecDeque;
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2286,4 +2290,915 @@ fn resource_registration_waits_for_transition_and_rejects_the_stale_generation()
         .unwrap(),
         0
     );
+}
+
+#[derive(Clone, Copy)]
+enum FakeAdmission {
+    Admitted,
+    Uncertain,
+    PanicBeforeCall,
+    PanicAfterCall,
+}
+
+#[derive(Default)]
+struct FakeWakeState {
+    preflight_count: usize,
+    admission_count: usize,
+    persisted_intents: Vec<bool>,
+    idempotency_keys: Vec<String>,
+}
+
+struct FakeWakeAdapter {
+    path: std::path::PathBuf,
+    state: Arc<Mutex<FakeWakeState>>,
+    failure: Option<DispatchFailure>,
+    admissions: VecDeque<FakeAdmission>,
+    open_circuit_after_intent: Option<i64>,
+}
+
+impl FakeWakeAdapter {
+    fn new(path: std::path::PathBuf, state: Arc<Mutex<FakeWakeState>>) -> Self {
+        Self {
+            path,
+            state,
+            failure: None,
+            admissions: VecDeque::from([FakeAdmission::Admitted]),
+            open_circuit_after_intent: None,
+        }
+    }
+}
+
+impl WakeAdapter for FakeWakeAdapter {
+    fn preflight(
+        &mut self,
+        _dispatch: &super::store::Dispatch,
+        _target: &WakeTarget<'_>,
+        _idempotency_key: &str,
+    ) -> std::result::Result<(), DispatchFailure> {
+        let mut state = self.state.lock().unwrap();
+        state.preflight_count += 1;
+        state.idempotency_keys.push(_idempotency_key.to_string());
+        drop(state);
+        if let Some(failure) = self.failure.take() {
+            return Err(failure);
+        }
+        Ok(())
+    }
+
+    fn before_admission_guard(&mut self, _dispatch: &super::store::Dispatch) {
+        if let Some(dispatch_id) = self.open_circuit_after_intent.take() {
+            Store::open(self.path.clone())
+                .unwrap()
+                .record_dispatch_failure(dispatch_id, "sibling_circuit", 302, 900)
+                .unwrap();
+        }
+    }
+
+    fn admit(&mut self, dispatch: &super::store::Dispatch) -> WakeAdmission {
+        match self
+            .admissions
+            .pop_front()
+            .unwrap_or(FakeAdmission::Admitted)
+        {
+            FakeAdmission::PanicBeforeCall => panic!("simulated crash before fake admission"),
+            behavior => {
+                let persisted = rusqlite::Connection::open(&self.path)
+                    .unwrap()
+                    .query_row(
+                        "SELECT state='WAKE_INTENT' AND idempotency_key=?2 FROM dispatch_outbox WHERE id=?1",
+                        rusqlite::params![dispatch.id, dispatch.idempotency_key],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap();
+                let mut state = self.state.lock().unwrap();
+                state.admission_count += 1;
+                state.persisted_intents.push(persisted);
+                drop(state);
+                match behavior {
+                    FakeAdmission::Admitted => WakeAdmission::Admitted,
+                    FakeAdmission::Uncertain => WakeAdmission::Uncertain,
+                    FakeAdmission::PanicAfterCall => panic!("simulated crash after fake admission"),
+                    FakeAdmission::PanicBeforeCall => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+fn coordinator_target<'a>() -> WakeTarget<'a> {
+    WakeTarget {
+        agent_key: "fgd-smoke-agent",
+        pubkey: TARGET_PUBKEY,
+        channel_id: CHANNEL,
+        thread_root_id: THREAD_ROOT,
+        instruction: "Perform the isolated coordinator wake.",
+    }
+}
+
+fn coordinator_for(
+    path: &std::path::Path,
+    objective_id: &str,
+    adapter: FakeWakeAdapter,
+) -> Coordinator<FakeWakeAdapter> {
+    let mut store = Store::open(path.to_path_buf()).unwrap();
+    if store.objective(objective_id).unwrap().is_none() {
+        store
+            .create_active(active(objective_id, "fgd-smoke-agent", 100, 200))
+            .unwrap();
+    }
+    Coordinator::new(store, adapter, "test-coordinator")
+}
+
+fn ledger_counts(path: &std::path::Path) -> (i64, i64) {
+    let db = rusqlite::Connection::open(path).unwrap();
+    let circuits = db
+        .query_row("SELECT COUNT(*) FROM provider_circuits", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let exceptions = db
+        .query_row("SELECT COUNT(*) FROM dispatch_exceptions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    (circuits, exceptions)
+}
+
+#[test]
+fn coordinator_runs_due_wake_exact_ack_and_proof_without_duplicate_intervention() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let adapter = FakeWakeAdapter::new(path.clone(), state.clone());
+    let mut coordinator = coordinator_for(&path, "REMH-COORDINATOR", adapter);
+
+    let sent = match coordinator
+        .coordinate_due("REMH-COORDINATOR", 300, coordinator_target())
+        .unwrap()
+    {
+        Coordination::Sent(dispatch) => dispatch,
+        other => panic!("expected sent dispatch, got {other:?}"),
+    };
+    assert_eq!(sent.state, DispatchState::Sent);
+    assert_eq!(
+        coordinator
+            .store()
+            .dispatches("REMH-COORDINATOR")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(state.lock().unwrap().admission_count, 1);
+    assert_eq!(state.lock().unwrap().persisted_intents, vec![true]);
+    assert_eq!(
+        coordinator
+            .coordinate_due("REMH-COORDINATOR", 301, coordinator_target())
+            .unwrap(),
+        Coordination::Silent(SilentReason::AlreadyIntervened)
+    );
+    assert_eq!(state.lock().unwrap().admission_count, 1);
+
+    assert_eq!(
+        coordinator
+            .acknowledge(SignedAckEvent {
+                event_id: "wrong-coordinator-ack",
+                author_pubkey: OTHER_PUBKEY,
+                channel_id: CHANNEL,
+                thread_root_id: THREAD_ROOT,
+                content: sent.ack_marker.as_deref().unwrap(),
+                created_at: 304,
+            })
+            .unwrap(),
+        AckOutcome::NoMatch
+    );
+    assert_eq!(
+        coordinator
+            .acknowledge(ack(
+                "exact-coordinator-ack",
+                sent.ack_marker.as_deref().unwrap(),
+                305,
+            ))
+            .unwrap(),
+        AckOutcome::Acknowledged(sent.id)
+    );
+    assert_eq!(
+        coordinator
+            .store()
+            .objective("REMH-COORDINATOR")
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+
+    let advanced = coordinator
+        .record_proof(ProofInput {
+            objective_id: "REMH-COORDINATOR",
+            expected_generation: 1,
+            kind: ProofKind::TestResult,
+            occurred_at: 400,
+            observed_at: 401,
+            reference: "coordinator:test-result",
+            digest: Some("sha256:coordinator-green"),
+            result: Some("PASS"),
+        })
+        .unwrap();
+    assert_eq!(advanced.generation, 2);
+    assert_eq!(
+        coordinator
+            .store_mut()
+            .evaluate("REMH-COORDINATOR", 1, 2_000, "fgd-smoke-agent")
+            .unwrap(),
+        Evaluation::Silent(SilentReason::StaleGeneration)
+    );
+    assert_eq!(state.lock().unwrap().admission_count, 1);
+}
+
+#[test]
+fn stale_generation_between_evaluate_claim_and_intent_is_rejected_without_mutation_or_failure_ledgers(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active("REMH-STALE-CLAIM", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let claim_id = reserve(&mut store, "REMH-STALE-CLAIM", 1, 300);
+    store
+        .record_verified_progress(proof("REMH-STALE-CLAIM", 400, 500))
+        .unwrap();
+    assert!(store.claim_dispatch(claim_id, "test", 401, 461).is_err());
+    assert_eq!(
+        store.dispatch(claim_id).unwrap().unwrap().state,
+        DispatchState::Pending
+    );
+    assert_eq!(ledger_counts(&path), (0, 0));
+
+    store
+        .create_active(active("REMH-STALE-INTENT", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let intent_id = reserve(&mut store, "REMH-STALE-INTENT", 1, 300);
+    store.claim_dispatch(intent_id, "test", 301, 500).unwrap();
+    store
+        .record_verified_progress(proof("REMH-STALE-INTENT", 400, 500))
+        .unwrap();
+    assert!(store
+        .record_wake_intent(
+            intent_id,
+            "test",
+            WakeIntentInput {
+                target_agent_key: "fgd-smoke-agent",
+                target_pubkey: TARGET_PUBKEY,
+                channel_id: CHANNEL,
+                thread_root_id: THREAD_ROOT,
+                idempotency_key: "stale-intent",
+                instruction: "must not wake",
+            },
+            401,
+        )
+        .is_err());
+    let intent = store.dispatch(intent_id).unwrap().unwrap();
+    assert_eq!(intent.state, DispatchState::Claimed);
+    assert!(intent.wake_intent_at.is_none());
+    assert_eq!(ledger_counts(&path), (0, 0));
+}
+
+#[test]
+fn provider_circuit_blocks_claim_and_failed_generation_never_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let mut adapter = FakeWakeAdapter::new(path.clone(), state.clone());
+    adapter.failure = Some(DispatchFailure {
+        code: "fake_provider_unavailable".into(),
+        open_until: 900,
+    });
+    let mut coordinator = coordinator_for(&path, "REMH-COORDINATOR-FAIL", adapter);
+
+    let failed = match coordinator
+        .coordinate_due("REMH-COORDINATOR-FAIL", 300, coordinator_target())
+        .unwrap()
+    {
+        Coordination::Failed(dispatch) => dispatch,
+        other => panic!("expected failure, got {other:?}"),
+    };
+    assert_eq!(failed.state, DispatchState::Failed);
+    assert_eq!(state.lock().unwrap().admission_count, 0);
+    assert_eq!(
+        coordinator
+            .coordinate_due("REMH-COORDINATOR-FAIL", 501, coordinator_target())
+            .unwrap(),
+        Coordination::Silent(SilentReason::ProviderCircuitOpen)
+    );
+
+    let advanced = coordinator
+        .record_proof(ProofInput {
+            objective_id: "REMH-COORDINATOR-FAIL",
+            expected_generation: 1,
+            kind: ProofKind::TestResult,
+            occurred_at: 600,
+            observed_at: 601,
+            reference: "coordinator:recovered",
+            digest: Some("sha256:coordinator-recovered"),
+            result: Some("PASS"),
+        })
+        .unwrap();
+    assert_eq!(advanced.generation, 2);
+    assert_eq!(
+        coordinator
+            .coordinate_due("REMH-COORDINATOR-FAIL", 800, coordinator_target())
+            .unwrap(),
+        Coordination::Silent(SilentReason::ProviderCircuitOpen)
+    );
+    assert!(matches!(
+        coordinator
+            .coordinate_due("REMH-COORDINATOR-FAIL", 1_500, coordinator_target())
+            .unwrap(),
+        Coordination::Sent(_)
+    ));
+    let dispatches = coordinator
+        .store()
+        .dispatches("REMH-COORDINATOR-FAIL")
+        .unwrap();
+    assert_eq!(dispatches.len(), 2);
+    assert_eq!(dispatches[0].state, DispatchState::Failed);
+    assert_eq!(dispatches[1].objective_generation, 2);
+    assert_eq!(dispatches[1].attempt, 1);
+}
+
+#[test]
+fn open_provider_circuit_refuses_an_existing_pending_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    store
+        .create_active(active("REMH-CIRCUIT-A", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    store
+        .create_active(active("REMH-CIRCUIT-B", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let blocked = reserve(&mut store, "REMH-CIRCUIT-A", 1, 300);
+    let failure = reserve(&mut store, "REMH-CIRCUIT-B", 1, 300);
+    store
+        .record_dispatch_failure(failure, "provider_down", 301, 900)
+        .unwrap();
+    assert!(store.claim_dispatch(blocked, "test", 302, 362).is_err());
+    assert_eq!(
+        store.dispatch(blocked).unwrap().unwrap().state,
+        DispatchState::Pending
+    );
+}
+
+#[test]
+fn dormant_objective_is_silent_and_coordinator_has_no_human_transition_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active(
+            "REMH-DORMANT-COORDINATOR",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    admit_owner_decision(
+        &mut store,
+        "REMH-DORMANT-COORDINATOR",
+        1,
+        "authority:dormant",
+        150,
+    );
+    store
+        .route_blocker(BlockerInput {
+            objective_id: "REMH-DORMANT-COORDINATOR",
+            expected_generation: 1,
+            route: BlockerRoute::HumanOwner,
+            diagnosed_at: 160,
+            reference: "owner:pause",
+            authority_admission_reference: Some("authority:dormant"),
+        })
+        .unwrap();
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let adapter = FakeWakeAdapter::new(path, state.clone());
+    let mut coordinator = Coordinator::new(store, adapter, "test-coordinator");
+    assert_eq!(
+        coordinator
+            .coordinate_due("REMH-DORMANT-COORDINATOR", 1_000, coordinator_target())
+            .unwrap(),
+        Coordination::Silent(SilentReason::Dormant)
+    );
+    assert_eq!(state.lock().unwrap().preflight_count, 0);
+    assert_eq!(state.lock().unwrap().admission_count, 0);
+    let source = include_str!("coordinator.rs");
+    assert!(!source.contains("admit_human_authority"));
+    assert!(!source.contains("route_blocker"));
+    assert!(!source.contains("ready_for_owner_test"));
+}
+
+#[test]
+fn coordinator_crash_boundaries_never_blindly_replay_fake_admission() {
+    for (name, behavior, expected_calls) in [
+        ("before-call", FakeAdmission::PanicBeforeCall, 0),
+        ("after-call", FakeAdmission::PanicAfterCall, 1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-CRASH-{name}");
+        let state = Arc::new(Mutex::new(FakeWakeState::default()));
+        let mut adapter = FakeWakeAdapter::new(path.clone(), state.clone());
+        adapter.admissions = VecDeque::from([behavior]);
+        let mut coordinator = coordinator_for(&path, &objective_id, adapter);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            coordinator.coordinate_due(&objective_id, 300, coordinator_target())
+        }));
+        assert!(result.is_err());
+        assert_eq!(state.lock().unwrap().admission_count, expected_calls);
+        let dispatch = coordinator
+            .store()
+            .dispatches(&objective_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(dispatch.state, DispatchState::WakeIntent);
+        drop(coordinator);
+
+        let restarted_state = Arc::new(Mutex::new(FakeWakeState::default()));
+        let restarted_adapter = FakeWakeAdapter::new(path.clone(), restarted_state.clone());
+        let reopened = Store::open(path).unwrap();
+        let mut restarted = Coordinator::new(reopened, restarted_adapter, "test-coordinator");
+        restarted.reconcile_startup(&[], 1_000, 900).unwrap();
+        assert_eq!(
+            restarted
+                .store()
+                .dispatch(dispatch.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DispatchState::VerifyBeforeRetry
+        );
+        assert_eq!(
+            restarted
+                .coordinate_due(&objective_id, 1_001, coordinator_target())
+                .unwrap(),
+            Coordination::Silent(SilentReason::AlreadyIntervened)
+        );
+        assert_eq!(restarted_state.lock().unwrap().admission_count, 0);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let adapter = FakeWakeAdapter::new(path.clone(), state.clone());
+    let mut coordinator = coordinator_for(&path, "REMH-CRASH-AFTER-SENT", adapter);
+    let sent = match coordinator
+        .coordinate_due("REMH-CRASH-AFTER-SENT", 300, coordinator_target())
+        .unwrap()
+    {
+        Coordination::Sent(dispatch) => dispatch,
+        other => panic!("expected sent dispatch, got {other:?}"),
+    };
+    assert_eq!(state.lock().unwrap().admission_count, 1);
+    drop(coordinator);
+    let restarted_state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let reopened = Store::open(path.clone()).unwrap();
+    let mut restarted = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(path, restarted_state.clone()),
+        "test-coordinator",
+    );
+    restarted.reconcile_startup(&[], 1_000, 900).unwrap();
+    assert_eq!(
+        restarted.store().dispatch(sent.id).unwrap().unwrap().state,
+        DispatchState::Sent
+    );
+    assert_eq!(restarted_state.lock().unwrap().admission_count, 0);
+}
+
+#[test]
+fn circuit_opened_after_claim_blocks_intent_until_equality_closes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    store
+        .create_active(active("REMH-HELD-CLAIM", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    store
+        .create_active(active("REMH-SIBLING-FAIL", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let held = reserve(&mut store, "REMH-HELD-CLAIM", 1, 300);
+    let sibling = reserve(&mut store, "REMH-SIBLING-FAIL", 1, 300);
+    store.claim_dispatch(held, "test", 301, 1_000).unwrap();
+    store
+        .record_dispatch_failure(sibling, "provider_down", 302, 900)
+        .unwrap();
+    let intent = |key| WakeIntentInput {
+        target_agent_key: "fgd-smoke-agent",
+        target_pubkey: TARGET_PUBKEY,
+        channel_id: CHANNEL,
+        thread_root_id: THREAD_ROOT,
+        idempotency_key: key,
+        instruction: "guard the wake boundary",
+    };
+    assert!(store
+        .record_wake_intent(held, "test", intent("blocked"), 303)
+        .is_err());
+    assert_eq!(
+        store.dispatch(held).unwrap().unwrap().state,
+        DispatchState::Claimed
+    );
+    let frozen = store
+        .record_wake_intent(held, "test", intent("equality-closed"), 900)
+        .unwrap();
+    assert_eq!(frozen.state, DispatchState::WakeIntent);
+}
+
+#[test]
+fn circuit_opened_after_frozen_intent_prevents_admission_and_restart_quarantines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active("REMH-POST-INTENT", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    store
+        .create_active(active(
+            "REMH-POST-INTENT-SIBLING",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let sibling = reserve(&mut store, "REMH-POST-INTENT-SIBLING", 1, 300);
+    drop(store);
+
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let mut adapter = FakeWakeAdapter::new(path.clone(), state.clone());
+    adapter.open_circuit_after_intent = Some(sibling);
+    let mut coordinator = coordinator_for(&path, "REMH-POST-INTENT", adapter);
+    let uncertain = match coordinator
+        .coordinate_due("REMH-POST-INTENT", 300, coordinator_target())
+        .unwrap()
+    {
+        Coordination::Uncertain(dispatch) => dispatch,
+        other => panic!("expected guarded uncertain intent, got {other:?}"),
+    };
+    assert_eq!(uncertain.state, DispatchState::WakeIntent);
+    assert_eq!(state.lock().unwrap().admission_count, 0);
+    drop(coordinator);
+
+    let reopened = Store::open(path).unwrap();
+    let restart_state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let mut restarted = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(
+            dir.path().join("control-plane.sqlite3"),
+            restart_state.clone(),
+        ),
+        "test-coordinator",
+    );
+    restarted.reconcile_startup(&[], 1_000, 900).unwrap();
+    assert_eq!(
+        restarted
+            .store()
+            .dispatch(uncertain.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::VerifyBeforeRetry
+    );
+    assert_eq!(restart_state.lock().unwrap().admission_count, 0);
+}
+
+#[test]
+fn expired_pre_boundary_claim_recovers_pending_at_same_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    store
+        .create_active(active("REMH-EXPIRED-CLAIM", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let id = reserve(&mut store, "REMH-EXPIRED-CLAIM", 1, 300);
+    store.claim_dispatch(id, "first-holder", 301, 361).unwrap();
+    store.reconcile_startup(&[], 1_000, 900).unwrap();
+    let recovered = store.dispatch(id).unwrap().unwrap();
+    assert_eq!(recovered.state, DispatchState::Pending);
+    assert_eq!(recovered.attempt, 1);
+    let reclaimed = store
+        .claim_dispatch(id, "second-holder", 1_001, 1_061)
+        .unwrap();
+    assert_eq!(reclaimed.state, DispatchState::Claimed);
+    assert_eq!(reclaimed.attempt, 1);
+}
+
+#[test]
+fn coordinator_reopens_and_resumes_the_same_pending_dispatch_before_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active("REMH-RESUME-PENDING", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let dispatch_id = reserve(&mut store, "REMH-RESUME-PENDING", 1, 300);
+    drop(store);
+
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let reopened = Store::open(path.clone()).unwrap();
+    let mut coordinator = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(path, state.clone()),
+        "restart-coordinator",
+    );
+    let sent = match coordinator
+        .coordinate_due("REMH-RESUME-PENDING", 301, coordinator_target())
+        .unwrap()
+    {
+        Coordination::Sent(dispatch) => dispatch,
+        other => panic!("expected resumed pending dispatch, got {other:?}"),
+    };
+
+    assert_eq!(sent.id, dispatch_id);
+    assert_eq!(sent.state, DispatchState::Sent);
+    assert_eq!(sent.attempt, 1);
+    let dispatches = coordinator
+        .store()
+        .dispatches("REMH-RESUME-PENDING")
+        .unwrap();
+    assert_eq!(dispatches.len(), 1);
+    assert_eq!(dispatches[0].id, dispatch_id);
+    assert_eq!(state.lock().unwrap().preflight_count, 1);
+    assert_eq!(state.lock().unwrap().admission_count, 1);
+}
+
+#[test]
+fn coordinator_waits_for_claim_expiry_then_resumes_the_same_reconciled_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active("REMH-RESUME-CLAIMED", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let dispatch_id = reserve(&mut store, "REMH-RESUME-CLAIMED", 1, 300);
+    store
+        .claim_dispatch(dispatch_id, "crashed-holder", 301, 1_000)
+        .unwrap();
+    drop(store);
+
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let reopened = Store::open(path.clone()).unwrap();
+    let mut coordinator = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(path, state.clone()),
+        "restart-coordinator",
+    );
+    coordinator.reconcile_startup(&[], 500, 500).unwrap();
+    assert_eq!(
+        coordinator
+            .coordinate_due("REMH-RESUME-CLAIMED", 501, coordinator_target())
+            .unwrap(),
+        Coordination::Silent(SilentReason::AlreadyIntervened)
+    );
+    assert_eq!(state.lock().unwrap().preflight_count, 0);
+    assert_eq!(state.lock().unwrap().admission_count, 0);
+    assert_eq!(
+        coordinator
+            .store()
+            .dispatch(dispatch_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::Claimed
+    );
+
+    coordinator.reconcile_startup(&[], 1_000, 1_000).unwrap();
+    let sent = match coordinator
+        .coordinate_due("REMH-RESUME-CLAIMED", 1_001, coordinator_target())
+        .unwrap()
+    {
+        Coordination::Sent(dispatch) => dispatch,
+        other => panic!("expected resumed reconciled dispatch, got {other:?}"),
+    };
+    assert_eq!(sent.id, dispatch_id);
+    assert_eq!(sent.state, DispatchState::Sent);
+    assert_eq!(sent.attempt, 1);
+    assert_eq!(
+        coordinator
+            .store()
+            .dispatches("REMH-RESUME-CLAIMED")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(state.lock().unwrap().preflight_count, 1);
+    assert_eq!(state.lock().unwrap().admission_count, 1);
+}
+
+#[test]
+fn coordinator_does_not_resume_failed_or_verify_before_retry_dispatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active("REMH-NO-RESUME-FAILED", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    store
+        .create_active(active("REMH-NO-RESUME-VERIFY", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let failed_id = reserve(&mut store, "REMH-NO-RESUME-FAILED", 1, 300);
+    let verify_id = reserve(&mut store, "REMH-NO-RESUME-VERIFY", 1, 300);
+    freeze(&mut store, verify_id, 301, "no-resume-verify");
+    store
+        .record_dispatch_failure(failed_id, "provider_down", 301, 900)
+        .unwrap();
+    store.reconcile_startup(&[], 1_000, 900).unwrap();
+    drop(store);
+
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let reopened = Store::open(path.clone()).unwrap();
+    let mut coordinator = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(path, state.clone()),
+        "restart-coordinator",
+    );
+    for objective_id in ["REMH-NO-RESUME-FAILED", "REMH-NO-RESUME-VERIFY"] {
+        assert_eq!(
+            coordinator
+                .coordinate_due(objective_id, 1_001, coordinator_target())
+                .unwrap(),
+            Coordination::Silent(SilentReason::AlreadyIntervened)
+        );
+    }
+    assert_eq!(state.lock().unwrap().preflight_count, 0);
+    assert_eq!(state.lock().unwrap().admission_count, 0);
+    assert_eq!(
+        coordinator
+            .store()
+            .dispatch(failed_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::Failed
+    );
+    assert_eq!(
+        coordinator
+            .store()
+            .dispatch(verify_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::VerifyBeforeRetry
+    );
+}
+
+#[test]
+fn coordinator_never_selects_an_older_generation_pending_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active(
+            "REMH-CURRENT-GENERATION-ONLY",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let older_id = reserve(&mut store, "REMH-CURRENT-GENERATION-ONLY", 1, 300);
+    store
+        .record_verified_progress(proof("REMH-CURRENT-GENERATION-ONLY", 400, 500))
+        .unwrap();
+    let current_id = reserve(&mut store, "REMH-CURRENT-GENERATION-ONLY", 2, 600);
+    freeze(&mut store, current_id, 601, "current-generation-only");
+    store.reconcile_startup(&[], 1_000, 900).unwrap();
+    drop(store);
+
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let reopened = Store::open(path.clone()).unwrap();
+    let mut coordinator = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(path, state.clone()),
+        "restart-coordinator",
+    );
+    assert_eq!(
+        coordinator
+            .coordinate_due("REMH-CURRENT-GENERATION-ONLY", 1_001, coordinator_target())
+            .unwrap(),
+        Coordination::Silent(SilentReason::AlreadyIntervened)
+    );
+    assert_eq!(state.lock().unwrap().preflight_count, 0);
+    assert_eq!(state.lock().unwrap().admission_count, 0);
+    assert_eq!(
+        coordinator
+            .store()
+            .dispatch(older_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::Pending
+    );
+    assert_eq!(
+        coordinator
+            .store()
+            .dispatch(current_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::VerifyBeforeRetry
+    );
+}
+
+#[test]
+fn resumed_pending_dispatch_preserves_target_and_rejects_a_mismatched_target_before_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active("REMH-RESUME-TARGET", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let dispatch_id = reserve(&mut store, "REMH-RESUME-TARGET", 1, 300);
+    drop(store);
+
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let reopened = Store::open(path.clone()).unwrap();
+    let mut coordinator = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(path, state.clone()),
+        "restart-coordinator",
+    );
+    let result = coordinator.coordinate_due(
+        "REMH-RESUME-TARGET",
+        301,
+        WakeTarget {
+            agent_key: "different-agent",
+            ..coordinator_target()
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(state.lock().unwrap().preflight_count, 1);
+    assert_eq!(state.lock().unwrap().admission_count, 0);
+    let dispatch = coordinator.store().dispatch(dispatch_id).unwrap().unwrap();
+    assert_eq!(dispatch.id, dispatch_id);
+    assert_eq!(dispatch.attempt, 1);
+    assert_eq!(dispatch.target_agent_key, "fgd-smoke-agent");
+    assert_eq!(dispatch.state, DispatchState::Claimed);
+}
+
+#[test]
+fn adapter_uncertainty_remains_frozen_and_non_replayable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let mut adapter = FakeWakeAdapter::new(path.clone(), state.clone());
+    adapter.admissions = VecDeque::from([FakeAdmission::Uncertain]);
+    let mut coordinator = coordinator_for(&path, "REMH-ADAPTER-UNCERTAIN", adapter);
+    let dispatch = match coordinator
+        .coordinate_due("REMH-ADAPTER-UNCERTAIN", 300, coordinator_target())
+        .unwrap()
+    {
+        Coordination::Uncertain(dispatch) => dispatch,
+        other => panic!("expected uncertain admission, got {other:?}"),
+    };
+    assert_eq!(dispatch.state, DispatchState::WakeIntent);
+    assert_eq!(state.lock().unwrap().admission_count, 1);
+    drop(coordinator);
+
+    let reopened = Store::open(path.clone()).unwrap();
+    let restart_state = Arc::new(Mutex::new(FakeWakeState::default()));
+    let mut restarted = Coordinator::new(
+        reopened,
+        FakeWakeAdapter::new(path, restart_state.clone()),
+        "test-coordinator",
+    );
+    restarted.reconcile_startup(&[], 1_000, 900).unwrap();
+    assert_eq!(
+        restarted
+            .store()
+            .dispatch(dispatch.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::VerifyBeforeRetry
+    );
+    assert_eq!(restart_state.lock().unwrap().admission_count, 0);
+}
+
+#[test]
+fn coordinator_idempotency_key_is_deterministic_from_stable_dispatch_fields() {
+    let mut keys = Vec::new();
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let state = Arc::new(Mutex::new(FakeWakeState::default()));
+        let adapter = FakeWakeAdapter::new(path.clone(), state.clone());
+        let mut coordinator = coordinator_for(&path, "REMH-DETERMINISTIC-KEY", adapter);
+        assert!(matches!(
+            coordinator
+                .coordinate_due("REMH-DETERMINISTIC-KEY", 300, coordinator_target())
+                .unwrap(),
+            Coordination::Sent(_)
+        ));
+        keys.push(state.lock().unwrap().idempotency_keys[0].clone());
+    }
+    assert_eq!(keys[0], keys[1]);
+    assert!(keys[0].starts_with("remh-oi:"));
+    assert_eq!(keys[0].len(), 72);
 }

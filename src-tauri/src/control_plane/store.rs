@@ -857,6 +857,22 @@ impl Store {
         )
     }
 
+    pub(super) fn dispatch_for_generation(
+        &self,
+        objective_id: &str,
+        generation: i64,
+    ) -> Result<Option<Dispatch>> {
+        database(
+            self.connection
+                .query_row(
+                    "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,claimed_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,created_at,updated_at FROM dispatch_outbox WHERE objective_id=?1 AND objective_generation=?2",
+                    params![objective_id, generation],
+                    dispatch_row,
+                )
+                .optional(),
+        )
+    }
+
     pub(super) fn dispatches(&self, objective_id: &str) -> Result<Vec<Dispatch>> {
         let mut statement = database(self.connection.prepare(
             "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,claimed_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,created_at,updated_at FROM dispatch_outbox WHERE objective_id=?1 ORDER BY id",
@@ -1000,13 +1016,18 @@ impl Store {
         if holder.is_empty() || holder.len() > 256 || expires_at <= claimed_at {
             return Err("Invalid dispatch claim".into());
         }
-        let changed = database(self.connection.execute(
-            "UPDATE dispatch_outbox SET state='CLAIMED',lease_holder=?2,claimed_at=?3,claim_expires_at=?4,updated_at=?3 WHERE id=?1 AND state='PENDING'",
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let changed = database(tx.execute(
+            "UPDATE dispatch_outbox SET state='CLAIMED',lease_holder=?2,claimed_at=?3,claim_expires_at=?4,updated_at=?3 WHERE id=?1 AND state='PENDING' AND EXISTS(SELECT 1 FROM objectives o WHERE o.objective_id=dispatch_outbox.objective_id AND o.state='ACTIVE' AND o.generation=dispatch_outbox.objective_generation AND NOT EXISTS(SELECT 1 FROM provider_circuits p WHERE p.client_scope=o.client_scope AND p.open_until>?3))",
             params![dispatch_id,holder,claimed_at,expires_at],
         ))?;
         if changed != 1 {
             return Err("Dispatch is not available to claim".into());
         }
+        database(tx.commit())?;
         self.dispatch(dispatch_id)?
             .ok_or("Control-plane dispatch disappeared".into())
     }
@@ -1049,15 +1070,28 @@ impl Store {
             "{}\n\nAfter handling this wake, return exactly this marker as your final response:\n{}",
             input.instruction, marker
         );
-        let changed = database(self.connection.execute(
-            "UPDATE dispatch_outbox SET state='WAKE_INTENT',target_pubkey=?3,channel_id=?4,thread_root_id=?5,idempotency_key=?6,ack_marker=?7,wake_payload=?8,wake_intent_at=?9,recovery_state=NULL,error_code=NULL,updated_at=?9 WHERE id=?1 AND state='CLAIMED' AND lease_holder=?2 AND claim_expires_at>?9",
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let changed = database(tx.execute(
+            "UPDATE dispatch_outbox SET state='WAKE_INTENT',target_pubkey=?3,channel_id=?4,thread_root_id=?5,idempotency_key=?6,ack_marker=?7,wake_payload=?8,wake_intent_at=?9,recovery_state=NULL,error_code=NULL,updated_at=?9 WHERE id=?1 AND state='CLAIMED' AND lease_holder=?2 AND claim_expires_at>?9 AND EXISTS(SELECT 1 FROM objectives o WHERE o.objective_id=dispatch_outbox.objective_id AND o.state='ACTIVE' AND o.generation=dispatch_outbox.objective_generation AND NOT EXISTS(SELECT 1 FROM provider_circuits p WHERE p.client_scope=o.client_scope AND p.open_until>?9))",
             params![dispatch_id,holder,input.target_pubkey,input.channel_id,input.thread_root_id,input.idempotency_key,marker,payload,wake_intent_at],
         ))?;
         if changed != 1 {
             return Err("Dispatch wake intent was not frozen".into());
         }
+        database(tx.commit())?;
         self.dispatch(dispatch_id)?
             .ok_or("Control-plane dispatch disappeared".into())
+    }
+
+    pub(super) fn admission_ready(&self, dispatch_id: i64, now: i64) -> Result<bool> {
+        database(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatch_outbox d JOIN objectives o ON o.objective_id=d.objective_id WHERE d.id=?1 AND d.state='WAKE_INTENT' AND o.state='ACTIVE' AND o.generation=d.objective_generation AND NOT EXISTS(SELECT 1 FROM provider_circuits p WHERE p.client_scope=o.client_scope AND p.open_until>?2))",
+            params![dispatch_id, now],
+            |row| row.get(0),
+        ))
     }
 
     pub(super) fn record_sent(&mut self, dispatch_id: i64, sent_at: i64) -> Result<Dispatch> {
