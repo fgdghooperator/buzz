@@ -1,6 +1,6 @@
 use super::store::{
-    ActivationFenceBinding, Dispatch, DispatchState, Evaluation, ObjectiveState, Result,
-    SilentReason, Store, WakeIntentInput,
+    ActivationFenceBinding, ActivationReceipt, Dispatch, DispatchState, Evaluation, ObjectiveState,
+    Result, SilentReason, Store, WakeIntentInput,
 };
 use sha2::{Digest, Sha256};
 
@@ -38,17 +38,17 @@ pub(super) struct AdapterFailure {
     pub open_for: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum AdapterResult {
-    Admitted,
+    Admitted(ActivationReceipt),
     Rejected,
     Error,
     Timeout,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum AdapterStatus {
-    Confirmed { admitted_at: i64 },
+    Confirmed(ActivationReceipt),
     Absent,
     Uncertain,
     Rejected,
@@ -87,6 +87,21 @@ impl ActivationPermit {
 
     pub(super) fn admitted_at(&self) -> i64 {
         self.admitted_at
+    }
+
+    pub(super) fn receipt(&self) -> ActivationReceipt {
+        ActivationReceipt {
+            objective_id: self.binding.objective_id.clone(),
+            generation: self.binding.generation,
+            attempt: self.binding.attempt,
+            target_agent_key: self.binding.target_agent_key.clone(),
+            target_pubkey: self.binding.target_pubkey.clone(),
+            channel_id: self.binding.channel_id.clone(),
+            thread_root_id: self.binding.thread_root_id.clone(),
+            authority_digest: self.authority_digest.clone(),
+            idempotency_key: self.binding.idempotency_key.clone(),
+            admitted_at: self.admitted_at,
+        }
     }
 }
 
@@ -188,15 +203,12 @@ where
         {
             return Err("Activation dispatch is not quarantined for reconciliation".into());
         }
-        let idempotency_key = dispatch
-            .idempotency_key
-            .clone()
-            .ok_or("Quarantined activation dispatch has no idempotency key")?;
-        let AdapterStatus::Confirmed { admitted_at } = self.adapter.status(&dispatch)? else {
+        let AdapterStatus::Confirmed(receipt) = self.adapter.status(&dispatch)? else {
             return Ok(dispatch);
         };
+        let trusted_now = self.trusted_time(None)?;
         self.store
-            .record_reconciled_activation_sent(dispatch_id, &idempotency_key, admitted_at)
+            .record_reconciled_activation_sent(dispatch_id, &receipt, trusted_now)
     }
 
     pub(super) fn coordinate(
@@ -341,8 +353,8 @@ where
             &authority_digest,
         )?;
         match adapter_result {
-            Some(AdapterResult::Admitted) => {
-                let sent_at = match self.trusted_time(Some(admission_at)) {
+            Some(AdapterResult::Admitted(receipt)) => {
+                let trusted_now = match self.trusted_time(Some(admission_at)) {
                     Ok(now) => now,
                     Err(_) => {
                         return Ok(ActivationOutcome::Uncertain(fresh_dispatch(
@@ -353,8 +365,8 @@ where
                 };
                 Ok(ActivationOutcome::Sent(self.store.record_activation_sent(
                     frozen.id,
-                    frozen.idempotency_key.as_deref().unwrap_or_default(),
-                    sent_at,
+                    Some(&receipt),
+                    trusted_now,
                 )?))
             }
             Some(AdapterResult::Rejected | AdapterResult::Error | AdapterResult::Timeout)
@@ -415,6 +427,7 @@ pub(super) fn fence_binding(dispatch: &Dispatch) -> Result<ActivationFenceBindin
         dispatch_id: dispatch.id,
         objective_id: dispatch.objective_id.clone(),
         generation: dispatch.objective_generation,
+        attempt: dispatch.attempt,
         holder: dispatch
             .lease_holder
             .clone()

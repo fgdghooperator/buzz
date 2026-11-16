@@ -237,12 +237,105 @@ pub(super) struct ActivationFenceBinding {
     pub dispatch_id: i64,
     pub objective_id: String,
     pub generation: i64,
+    pub attempt: i64,
     pub holder: String,
     pub target_agent_key: String,
     pub target_pubkey: String,
     pub channel_id: String,
     pub thread_root_id: String,
     pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ActivationReceipt {
+    pub objective_id: String,
+    pub generation: i64,
+    pub attempt: i64,
+    pub target_agent_key: String,
+    pub target_pubkey: String,
+    pub channel_id: String,
+    pub thread_root_id: String,
+    pub authority_digest: String,
+    pub idempotency_key: String,
+    pub admitted_at: i64,
+}
+
+impl ActivationReceipt {
+    pub(super) fn from_dispatch(dispatch: &Dispatch, admitted_at: i64) -> Result<Self> {
+        let idempotency_key = dispatch
+            .idempotency_key
+            .clone()
+            .ok_or("Activation receipt requires a persisted idempotency key")?;
+        let authority_digest = authority_digest_from_key(&idempotency_key)?;
+        Ok(Self {
+            objective_id: dispatch.objective_id.clone(),
+            generation: dispatch.objective_generation,
+            attempt: dispatch.attempt,
+            target_agent_key: dispatch.target_agent_key.clone(),
+            target_pubkey: dispatch
+                .target_pubkey
+                .clone()
+                .ok_or("Activation receipt requires a persisted pubkey")?,
+            channel_id: dispatch
+                .channel_id
+                .clone()
+                .ok_or("Activation receipt requires a persisted channel")?,
+            thread_root_id: dispatch
+                .thread_root_id
+                .clone()
+                .ok_or("Activation receipt requires a persisted thread root")?,
+            authority_digest,
+            idempotency_key,
+            admitted_at,
+        })
+    }
+
+    fn matches(&self, dispatch: &Dispatch) -> bool {
+        self.objective_id == dispatch.objective_id
+            && self.generation == dispatch.objective_generation
+            && self.attempt == dispatch.attempt
+            && self.target_agent_key == dispatch.target_agent_key
+            && dispatch.target_pubkey.as_deref() == Some(self.target_pubkey.as_str())
+            && dispatch.channel_id.as_deref() == Some(self.channel_id.as_str())
+            && dispatch.thread_root_id.as_deref() == Some(self.thread_root_id.as_str())
+            && dispatch.idempotency_key.as_deref() == Some(self.idempotency_key.as_str())
+            && authority_digest_from_key(&self.idempotency_key).as_deref()
+                == Ok(self.authority_digest.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ActivationResolutionOutcome {
+    ConfirmedSent,
+    AbandonedNoReplay,
+}
+
+impl ActivationResolutionOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfirmedSent => "CONFIRMED_SENT",
+            Self::AbandonedNoReplay => "ABANDONED_NO_REPLAY",
+        }
+    }
+}
+
+pub(super) struct ActivationResolutionInput<'a> {
+    pub dispatch_id: i64,
+    pub actor: &'a str,
+    pub authority_role: &'a str,
+    pub admission_reference: &'a str,
+    pub decided_at: i64,
+    pub reason: &'a str,
+    pub outcome: ActivationResolutionOutcome,
+    pub receipt: Option<&'a ActivationReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ActivationResolutionAudit {
+    pub id: i64,
+    pub dispatch_id: i64,
+    pub outcome: String,
+    pub admission_reference: String,
 }
 
 pub(super) struct SmokePrepareInput<'a> {
@@ -381,6 +474,32 @@ impl Store {
                 let _ = connection.execute_batch("ROLLBACK");
                 return Err(format!("Control-plane migration failed: {error}"));
             }
+        }
+        if let Err(error) = connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS activation_resolution_audits(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               dispatch_id INTEGER NOT NULL,
+               objective_id TEXT NOT NULL,
+               generation INTEGER NOT NULL,
+               attempt INTEGER NOT NULL,
+               target_agent_key TEXT NOT NULL,
+               target_pubkey TEXT NOT NULL,
+               channel_id TEXT NOT NULL,
+               thread_root_id TEXT NOT NULL,
+               authority_digest TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL,
+               actor TEXT NOT NULL,
+               authority_role TEXT NOT NULL CHECK(authority_role IN ('OWNER','SUPERVISOR')),
+               admission_reference TEXT UNIQUE NOT NULL,
+               decided_at INTEGER NOT NULL,
+               reason TEXT NOT NULL,
+               outcome TEXT NOT NULL CHECK(outcome IN ('CONFIRMED_SENT','ABANDONED_NO_REPLAY')),
+               receipt_admitted_at INTEGER,
+               FOREIGN KEY(dispatch_id) REFERENCES dispatch_outbox(id)
+             ) STRICT;",
+        ) {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(format!("Control-plane migration failed: {error}"));
         }
         database(connection.execute_batch(
             "PRAGMA user_version=4; COMMIT; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;",
@@ -1216,13 +1335,18 @@ impl Store {
     pub(super) fn record_activation_sent(
         &mut self,
         dispatch_id: i64,
-        idempotency_key: &str,
-        sent_at: i64,
+        receipt: Option<&ActivationReceipt>,
+        trusted_now: i64,
     ) -> Result<Dispatch> {
-        let spent = format!("FENCE_SPENT:{idempotency_key}");
+        let receipt = receipt.ok_or("Activation SENT requires a confirmed receipt")?;
+        let dispatch = self
+            .dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch not found")?;
+        validate_activation_receipt(&dispatch, receipt, trusted_now)?;
+        let spent = format!("FENCE_SPENT:{}", receipt.idempotency_key);
         let changed = database(self.connection.execute(
             "UPDATE dispatch_outbox SET state='SENT',sent_at=?3,updated_at=MAX(updated_at,?3) WHERE id=?1 AND state='WAKE_INTENT' AND idempotency_key=?2 AND recovery_state=?4 AND wake_intent_at<=?3",
-            params![dispatch_id,idempotency_key,sent_at,spent],
+            params![dispatch_id,receipt.idempotency_key,receipt.admitted_at,spent],
         ))?;
         if changed != 1 {
             return Err("Only a spent activation fence may be marked SENT".into());
@@ -1234,19 +1358,113 @@ impl Store {
     pub(super) fn record_reconciled_activation_sent(
         &mut self,
         dispatch_id: i64,
-        idempotency_key: &str,
-        sent_at: i64,
+        receipt: &ActivationReceipt,
+        trusted_now: i64,
     ) -> Result<Dispatch> {
-        let spent = format!("FENCE_SPENT:{idempotency_key}");
+        let dispatch = self
+            .dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch not found")?;
+        validate_activation_receipt(&dispatch, receipt, trusted_now)?;
+        let spent = format!("FENCE_SPENT:{}", receipt.idempotency_key);
         let changed = database(self.connection.execute(
             "UPDATE dispatch_outbox SET state='SENT',sent_at=?3,recovery_state=?4,updated_at=MAX(updated_at,?3) WHERE id=?1 AND state='VERIFY_BEFORE_RETRY' AND recovery_state='UNCERTAIN_WAKE_BOUNDARY' AND idempotency_key=?2 AND wake_intent_at<=?3",
-            params![dispatch_id,idempotency_key,sent_at,spent],
+            params![dispatch_id,receipt.idempotency_key,receipt.admitted_at,spent],
         ))?;
         if changed != 1 {
             return Err("Confirmed activation admission could not be reconciled".into());
         }
         self.dispatch(dispatch_id)?
             .ok_or("Control-plane dispatch disappeared".into())
+    }
+
+    pub(super) fn resolve_uncertain_activation(
+        &mut self,
+        input: ActivationResolutionInput<'_>,
+        trusted_now: i64,
+    ) -> Result<Dispatch> {
+        if input.dispatch_id < 1
+            || input.actor.is_empty()
+            || input.actor.len() > 128
+            || !matches!(input.authority_role, "OWNER" | "SUPERVISOR")
+            || input.admission_reference.is_empty()
+            || input.admission_reference.len() > 512
+            || input.decided_at < 0
+            || input.decided_at > trusted_now
+            || input.reason.is_empty()
+            || input.reason.len() > 1_024
+        {
+            return Err("Invalid uncertain activation resolution".into());
+        }
+        let dispatch = self
+            .dispatch(input.dispatch_id)?
+            .ok_or("Control-plane dispatch not found")?;
+        if dispatch.state != DispatchState::VerifyBeforeRetry
+            || dispatch.recovery_state.as_deref() != Some("UNCERTAIN_WAKE_BOUNDARY")
+        {
+            return Err("Activation dispatch is not eligible for uncertain resolution".into());
+        }
+        let receipt_admitted_at = match input.outcome {
+            ActivationResolutionOutcome::ConfirmedSent => {
+                let receipt = input
+                    .receipt
+                    .ok_or("CONFIRMED_SENT requires an exact durable receipt")?;
+                validate_activation_receipt(&dispatch, receipt, trusted_now)?;
+                Some(receipt.admitted_at)
+            }
+            ActivationResolutionOutcome::AbandonedNoReplay => {
+                if input.receipt.is_some() {
+                    return Err("ABANDONED_NO_REPLAY does not accept a receipt".into());
+                }
+                None
+            }
+        };
+        let idempotency_key = dispatch
+            .idempotency_key
+            .as_deref()
+            .ok_or("Uncertain activation has no persisted idempotency key")?;
+        let authority_digest = authority_digest_from_key(idempotency_key)?;
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        database(tx.execute(
+            "INSERT INTO activation_resolution_audits(dispatch_id,objective_id,generation,attempt,target_agent_key,target_pubkey,channel_id,thread_root_id,authority_digest,idempotency_key,actor,authority_role,admission_reference,decided_at,reason,outcome,receipt_admitted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![dispatch.id,dispatch.objective_id,dispatch.objective_generation,dispatch.attempt,dispatch.target_agent_key,dispatch.target_pubkey,dispatch.channel_id,dispatch.thread_root_id,authority_digest,idempotency_key,input.actor,input.authority_role,input.admission_reference,input.decided_at,input.reason,input.outcome.as_str(),receipt_admitted_at],
+        ))?;
+        let changed = match input.outcome {
+            ActivationResolutionOutcome::ConfirmedSent => database(tx.execute(
+                "UPDATE dispatch_outbox SET state='SENT',sent_at=?2,recovery_state=('FENCE_SPENT:' || idempotency_key),updated_at=MAX(updated_at,?3) WHERE id=?1 AND state='VERIFY_BEFORE_RETRY' AND recovery_state='UNCERTAIN_WAKE_BOUNDARY'",
+                params![dispatch.id,receipt_admitted_at,input.decided_at],
+            ))?,
+            ActivationResolutionOutcome::AbandonedNoReplay => database(tx.execute(
+                "UPDATE dispatch_outbox SET recovery_state=('ABANDONED_NO_REPLAY:' || ?2),updated_at=?3 WHERE id=?1 AND state='VERIFY_BEFORE_RETRY' AND recovery_state='UNCERTAIN_WAKE_BOUNDARY'",
+                params![dispatch.id,input.admission_reference,input.decided_at],
+            ))?,
+        };
+        if changed != 1 {
+            return Err("Uncertain activation resolution lost its state boundary".into());
+        }
+        database(tx.commit())?;
+        self.dispatch(dispatch.id)?
+            .ok_or("Control-plane dispatch disappeared".into())
+    }
+
+    pub(super) fn activation_resolution_audits(
+        &self,
+        dispatch_id: i64,
+    ) -> Result<Vec<ActivationResolutionAudit>> {
+        let mut statement = database(self.connection.prepare(
+            "SELECT id,dispatch_id,outcome,admission_reference FROM activation_resolution_audits WHERE dispatch_id=?1 ORDER BY id",
+        ))?;
+        let rows = database(statement.query_map([dispatch_id], |row| {
+            Ok(ActivationResolutionAudit {
+                id: row.get(0)?,
+                dispatch_id: row.get(1)?,
+                outcome: row.get(2)?,
+                admission_reference: row.get(3)?,
+            })
+        }))?;
+        database(rows.collect())
     }
 
     pub(super) fn record_wake_intent(
@@ -1661,6 +1879,41 @@ fn smoke_dispatch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SmokeDispatch
         created_at: row.get(17)?,
         updated_at: row.get(18)?,
     })
+}
+
+fn authority_digest_from_key(idempotency_key: &str) -> Result<String> {
+    let mut parts = idempotency_key.split(':');
+    if parts.next() != Some("remh-oi") {
+        return Err("Activation idempotency key has no authority digest".into());
+    }
+    let digest = parts
+        .next()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("Activation idempotency key has no authority digest")?;
+    if parts.next().is_none() || parts.next().is_some() {
+        return Err("Activation idempotency key is malformed".into());
+    }
+    Ok(digest.to_string())
+}
+
+fn validate_activation_receipt(
+    dispatch: &Dispatch,
+    receipt: &ActivationReceipt,
+    trusted_now: i64,
+) -> Result<()> {
+    let wake_intent_at = dispatch
+        .wake_intent_at
+        .ok_or("Activation receipt requires a persisted wake intent time")?;
+    if trusted_now < wake_intent_at
+        || receipt.admitted_at < wake_intent_at
+        || receipt.admitted_at > trusted_now
+    {
+        return Err("Activation receipt is outside the trusted-time boundary".into());
+    }
+    if !receipt.matches(dispatch) {
+        return Err("Activation receipt does not match the persisted dispatch".into());
+    }
+    Ok(())
 }
 
 fn validate_wake_intent(holder: &str, input: &WakeIntentInput<'_>) -> Result<()> {

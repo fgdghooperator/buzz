@@ -27,7 +27,12 @@ fn unix_now() -> i64 {
     .unwrap()
 }
 
-fn active<'a>(id: &'a str, owner: &'a str, now: i64, review_at: i64) -> NewObjective<'a> {
+pub(super) fn active<'a>(
+    id: &'a str,
+    owner: &'a str,
+    now: i64,
+    review_at: i64,
+) -> NewObjective<'a> {
     let recovery_policy = match review_at - now {
         100 => "review-100",
         86_400 => "review-86400",
@@ -45,7 +50,7 @@ fn active<'a>(id: &'a str, owner: &'a str, now: i64, review_at: i64) -> NewObjec
     }
 }
 
-fn proof<'a>(objective_id: &'a str, at: i64, _next_review_at: i64) -> ProofInput<'a> {
+pub(super) fn proof<'a>(objective_id: &'a str, at: i64, _next_review_at: i64) -> ProofInput<'a> {
     ProofInput {
         objective_id,
         expected_generation: 1,
@@ -3562,7 +3567,7 @@ impl ActivationAdapter for TestActivationAdapter {
                 && thread == permit.thread_root_id();
             transaction.commit().unwrap();
             return if matches && status == "CONFIRMED" {
-                AdapterResult::Admitted
+                AdapterResult::Admitted(permit.receipt())
             } else {
                 AdapterResult::Rejected
             };
@@ -3612,7 +3617,7 @@ impl ActivationAdapter for TestActivationAdapter {
         }
         transaction.commit().unwrap();
         match self.behavior {
-            BoundaryBehavior::Admitted => AdapterResult::Admitted,
+            BoundaryBehavior::Admitted => AdapterResult::Admitted(permit.receipt()),
             BoundaryBehavior::Rejected => AdapterResult::Rejected,
             BoundaryBehavior::Error => AdapterResult::Error,
             BoundaryBehavior::Timeout => AdapterResult::Timeout,
@@ -3645,7 +3650,9 @@ impl ActivationAdapter for TestActivationAdapter {
             && dispatch.channel_id.as_deref() == Some(channel.as_str())
             && dispatch.thread_root_id.as_deref() == Some(thread.as_str());
         Ok(match (matching, status.as_str()) {
-            (true, "CONFIRMED") => AdapterStatus::Confirmed { admitted_at },
+            (true, "CONFIRMED") => AdapterStatus::Confirmed(
+                super::store::ActivationReceipt::from_dispatch(dispatch, admitted_at)?,
+            ),
             (true, "ABSENT") => AdapterStatus::Absent,
             (true, "REJECTED") => AdapterStatus::Rejected,
             _ => AdapterStatus::Uncertain,
@@ -3653,7 +3660,7 @@ impl ActivationAdapter for TestActivationAdapter {
     }
 }
 
-fn boundary_agent_records() -> Vec<AgentRecord> {
+pub(super) fn boundary_agent_records() -> Vec<AgentRecord> {
     vec![AgentRecord {
         agent_key: "fgd-smoke-agent".into(),
         pubkey: TARGET_PUBKEY.into(),
@@ -3662,7 +3669,7 @@ fn boundary_agent_records() -> Vec<AgentRecord> {
     }]
 }
 
-fn boundary_routes() -> Vec<CanonicalRoute> {
+pub(super) fn boundary_routes() -> Vec<CanonicalRoute> {
     vec![CanonicalRoute {
         channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0".into(),
         thread_root_id: THREAD_ROOT.into(),
@@ -4539,7 +4546,7 @@ fn activation_boundary_is_generation_silent_terminal_and_has_no_human_or_product
     assert!(!native_lib.contains("activation_boundary"));
 }
 
-fn ready_activation(
+pub(super) fn ready_activation(
     store: &mut Store,
     objective_id: &str,
     holder: &str,
