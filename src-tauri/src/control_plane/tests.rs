@@ -1,3 +1,7 @@
+use super::activation_boundary::{
+    admit_frozen, ActivationAdapter, ActivationBoundary, ActivationOutcome, AdapterFailure,
+    AdapterResult, AgentDirectory, AgentRecord, CanonicalRoute, RouteDirectory, TrustedClock,
+};
 use super::coordinator::{
     Coordination, Coordinator, DispatchFailure, WakeAdapter, WakeAdmission, WakeTarget,
 };
@@ -143,11 +147,156 @@ fn freeze(store: &mut Store, dispatch_id: i64, now: i64, key: &str) {
         .unwrap();
 }
 
+#[test]
+fn legacy_record_sent_rejects_every_activation_fence_row_but_preserves_legacy_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+
+    for (objective_id, key, fence_state) in [
+        ("REMH-ACTIVATION-READY", "activation-ready", "ready"),
+        ("REMH-ACTIVATION-BLOCKED", "activation-blocked", "blocked"),
+        ("REMH-ACTIVATION-SPENT", "activation-spent", "spent"),
+    ] {
+        store
+            .create_active(active(objective_id, "fgd-smoke-agent", 100, 200))
+            .unwrap();
+        let id = reserve(&mut store, objective_id, 1, 300);
+        store
+            .claim_activation_dispatch(id, "activation-holder", 301, 400)
+            .unwrap();
+        let frozen = store
+            .record_activation_wake_intent(
+                id,
+                "activation-holder",
+                WakeIntentInput {
+                    target_agent_key: "fgd-smoke-agent",
+                    target_pubkey: TARGET_PUBKEY,
+                    channel_id: CHANNEL,
+                    thread_root_id: THREAD_ROOT,
+                    idempotency_key: key,
+                    instruction: "Perform the isolated activation wake.",
+                },
+                302,
+            )
+            .unwrap();
+        let binding = super::activation_boundary::fence_binding(&frozen).unwrap();
+        match fence_state {
+            "blocked" => assert!(store
+                .block_activation_fence_if_invalid(&binding, 303, true)
+                .unwrap()),
+            "spent" => assert!(store
+                .consume_activation_fence(&binding, 303)
+                .unwrap()
+                .is_some()),
+            "ready" => {}
+            _ => unreachable!(),
+        }
+
+        let before = store.dispatch(id).unwrap().unwrap();
+        assert!(store.record_sent(id, 304).is_err());
+        let after = store.dispatch(id).unwrap().unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.state, DispatchState::WakeIntent);
+        assert!(after.ack_event_id.is_none());
+        assert!(after.acknowledged_at.is_none());
+        assert_eq!(ledger_counts(&path), (0, 0));
+    }
+
+    store
+        .create_active(active(
+            "REMH-LEGACY-RECORD-SENT",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let legacy = reserve(&mut store, "REMH-LEGACY-RECORD-SENT", 1, 300);
+    freeze(&mut store, legacy, 301, "legacy-record-sent");
+    assert_eq!(
+        store.record_sent(legacy, 304).unwrap().state,
+        DispatchState::Sent
+    );
+}
+
+#[test]
+fn activation_block_requires_exact_holder_and_valid_trusted_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    store
+        .create_active(active(
+            "REMH-ACTIVATION-EXACT-BLOCK",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let id = reserve(&mut store, "REMH-ACTIVATION-EXACT-BLOCK", 1, 300);
+    store
+        .claim_activation_dispatch(id, "activation-holder", 301, 400)
+        .unwrap();
+    let frozen = store
+        .record_activation_wake_intent(
+            id,
+            "activation-holder",
+            WakeIntentInput {
+                target_agent_key: "fgd-smoke-agent",
+                target_pubkey: TARGET_PUBKEY,
+                channel_id: CHANNEL,
+                thread_root_id: THREAD_ROOT,
+                idempotency_key: "exact-block",
+                instruction: "Perform the isolated activation wake.",
+            },
+            302,
+        )
+        .unwrap();
+    let binding = super::activation_boundary::fence_binding(&frozen).unwrap();
+    let mut wrong_holder = binding.clone();
+    wrong_holder.holder = "losing-holder".into();
+
+    assert!(!store
+        .block_activation_fence_if_invalid(&wrong_holder, 303, true)
+        .unwrap());
+    assert_eq!(
+        store
+            .dispatch(id)
+            .unwrap()
+            .unwrap()
+            .recovery_state
+            .as_deref(),
+        Some("FENCE_READY:exact-block")
+    );
+    assert!(store
+        .block_activation_fence_if_invalid(&binding, -1, true)
+        .is_err());
+    assert_eq!(
+        store
+            .dispatch(id)
+            .unwrap()
+            .unwrap()
+            .recovery_state
+            .as_deref(),
+        Some("FENCE_READY:exact-block")
+    );
+}
+
 fn ack<'a>(event_id: &'a str, marker: &'a str, at: i64) -> SignedAckEvent<'a> {
     SignedAckEvent {
         event_id,
         author_pubkey: TARGET_PUBKEY,
         channel_id: CHANNEL,
+        thread_root_id: THREAD_ROOT,
+        content: marker,
+        created_at: at,
+    }
+}
+
+fn activation_ack<'a>(event_id: &'a str, marker: &'a str, at: i64) -> SignedAckEvent<'a> {
+    SignedAckEvent {
+        event_id,
+        author_pubkey: TARGET_PUBKEY,
+        channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0",
         thread_root_id: THREAD_ROOT,
         content: marker,
         created_at: at,
@@ -3201,4 +3350,1288 @@ fn coordinator_idempotency_key_is_deterministic_from_stable_dispatch_fields() {
     assert_eq!(keys[0], keys[1]);
     assert!(keys[0].starts_with("remh-oi:"));
     assert_eq!(keys[0].len(), 72);
+}
+
+#[derive(Clone)]
+struct TestAgentDirectory {
+    records: Vec<AgentRecord>,
+}
+
+impl AgentDirectory for TestAgentDirectory {
+    fn records_for(&mut self, _agent_key: &str) -> super::store::Result<Vec<AgentRecord>> {
+        Ok(self.records.clone())
+    }
+}
+
+#[derive(Clone)]
+struct TestRouteDirectory {
+    routes: Vec<CanonicalRoute>,
+}
+
+impl RouteDirectory for TestRouteDirectory {
+    fn routes_for(&mut self, _objective_id: &str) -> super::store::Result<Vec<CanonicalRoute>> {
+        Ok(self.routes.clone())
+    }
+}
+
+struct TestClock {
+    values: VecDeque<i64>,
+}
+
+impl TestClock {
+    fn new(values: impl IntoIterator<Item = i64>) -> Self {
+        Self {
+            values: values.into_iter().collect(),
+        }
+    }
+}
+
+impl TrustedClock for TestClock {
+    fn now(&mut self) -> super::store::Result<i64> {
+        self.values
+            .pop_front()
+            .ok_or_else(|| "test clock exhausted".into())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BoundaryBehavior {
+    Admitted,
+    Rejected,
+    Error,
+    Timeout,
+    PanicBeforeExternalCall,
+    PanicAfterExternalCall,
+}
+
+#[derive(Default)]
+struct BoundaryAdapterState {
+    preflights: usize,
+    admissions: usize,
+    permits: Vec<(i64, String, String, String, String)>,
+}
+
+struct TestActivationAdapter {
+    state: Arc<Mutex<BoundaryAdapterState>>,
+    preflight_failure: Option<AdapterFailure>,
+    behavior: BoundaryBehavior,
+}
+
+impl ActivationAdapter for TestActivationAdapter {
+    fn preflight(
+        &mut self,
+        _dispatch: &super::store::Dispatch,
+    ) -> std::result::Result<(), AdapterFailure> {
+        self.state.lock().unwrap().preflights += 1;
+        self.preflight_failure.take().map_or(Ok(()), Err)
+    }
+
+    fn admit(
+        &mut self,
+        permit: super::activation_boundary::ActivationPermit,
+        dispatch: &super::store::Dispatch,
+    ) -> AdapterResult {
+        if matches!(self.behavior, BoundaryBehavior::PanicBeforeExternalCall) {
+            panic!("simulated crash before external fake call");
+        }
+        let mut state = self.state.lock().unwrap();
+        state.admissions += 1;
+        state.permits.push((
+            permit.dispatch_id(),
+            permit.idempotency_key().to_string(),
+            permit.pubkey().to_string(),
+            permit.channel_id().to_string(),
+            permit.thread_root_id().to_string(),
+        ));
+        assert_eq!(permit.dispatch_id(), dispatch.id);
+        drop(state);
+        match self.behavior {
+            BoundaryBehavior::Admitted => AdapterResult::Admitted,
+            BoundaryBehavior::Rejected => AdapterResult::Rejected,
+            BoundaryBehavior::Error => AdapterResult::Error,
+            BoundaryBehavior::Timeout => AdapterResult::Timeout,
+            BoundaryBehavior::PanicAfterExternalCall => {
+                panic!("simulated crash after external fake call")
+            }
+            BoundaryBehavior::PanicBeforeExternalCall => unreachable!(),
+        }
+    }
+}
+
+fn boundary_agent_records() -> Vec<AgentRecord> {
+    vec![AgentRecord {
+        agent_key: "fgd-smoke-agent".into(),
+        pubkey: TARGET_PUBKEY.into(),
+        active: true,
+    }]
+}
+
+fn boundary_routes() -> Vec<CanonicalRoute> {
+    vec![CanonicalRoute {
+        channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0".into(),
+        thread_root_id: THREAD_ROOT.into(),
+        member_pubkeys: vec![TARGET_PUBKEY.into()],
+    }]
+}
+
+fn activation_boundary_for(
+    path: &std::path::Path,
+    objective_id: &str,
+    agents: Vec<AgentRecord>,
+    routes: Vec<CanonicalRoute>,
+    times: impl IntoIterator<Item = i64>,
+    behavior: BoundaryBehavior,
+) -> (
+    ActivationBoundary<TestAgentDirectory, TestRouteDirectory, TestClock, TestActivationAdapter>,
+    Arc<Mutex<BoundaryAdapterState>>,
+) {
+    let mut store = Store::open(path.to_path_buf()).unwrap();
+    if store.objective(objective_id).unwrap().is_none() {
+        store
+            .create_active(active(objective_id, "fgd-smoke-agent", 100, 200))
+            .unwrap();
+    }
+    let state = Arc::new(Mutex::new(BoundaryAdapterState::default()));
+    let adapter = TestActivationAdapter {
+        state: state.clone(),
+        preflight_failure: None,
+        behavior,
+    };
+    (
+        ActivationBoundary::new(
+            store,
+            TestAgentDirectory { records: agents },
+            TestRouteDirectory { routes },
+            TestClock::new(times),
+            adapter,
+            "activation-boundary-test",
+        ),
+        state,
+    )
+}
+
+#[test]
+fn activation_boundary_resolves_canonical_identity_route_and_exact_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let (mut boundary, state) = activation_boundary_for(
+        &path,
+        "REMH-ACTIVATE-CANONICAL",
+        boundary_agent_records(),
+        boundary_routes(),
+        [300, 301, 302, 303],
+        BoundaryBehavior::Admitted,
+    );
+
+    let sent = match boundary.coordinate("REMH-ACTIVATE-CANONICAL", 1).unwrap() {
+        ActivationOutcome::Sent(dispatch) => dispatch,
+        other => panic!("expected sent activation, got {other:?}"),
+    };
+    assert_eq!(sent.target_agent_key, "fgd-smoke-agent");
+    assert_eq!(sent.target_pubkey.as_deref(), Some(TARGET_PUBKEY));
+    assert_eq!(
+        sent.channel_id.as_deref(),
+        Some("51d885db-c687-44a6-8f2c-01bd679e7bb0")
+    );
+    assert_eq!(sent.thread_root_id.as_deref(), Some(THREAD_ROOT));
+    assert_eq!(sent.state, DispatchState::Sent);
+    let adapter = state.lock().unwrap();
+    assert_eq!(adapter.preflights, 1);
+    assert_eq!(adapter.admissions, 1);
+    assert_eq!(adapter.permits.len(), 1);
+    assert_eq!(adapter.permits[0].0, sent.id);
+    assert_eq!(adapter.permits[0].1, sent.idempotency_key.clone().unwrap());
+}
+
+#[test]
+fn activation_boundary_rejects_missing_duplicate_inactive_renamed_and_malformed_identity_locally() {
+    let cases = [
+        ("missing", vec![]),
+        (
+            "duplicate",
+            vec![
+                boundary_agent_records()[0].clone(),
+                boundary_agent_records()[0].clone(),
+            ],
+        ),
+        (
+            "inactive",
+            vec![AgentRecord {
+                active: false,
+                ..boundary_agent_records()[0].clone()
+            }],
+        ),
+        (
+            "renamed",
+            vec![AgentRecord {
+                agent_key: "renamed-agent".into(),
+                ..boundary_agent_records()[0].clone()
+            }],
+        ),
+        (
+            "malformed",
+            vec![AgentRecord {
+                pubkey: "not-a-pubkey".into(),
+                ..boundary_agent_records()[0].clone()
+            }],
+        ),
+    ];
+    for (name, agents) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-ACTIVATE-IDENTITY-{name}");
+        let (mut boundary, state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            agents,
+            boundary_routes(),
+            [300],
+            BoundaryBehavior::Admitted,
+        );
+        assert_eq!(
+            boundary.coordinate(&objective_id, 1).unwrap(),
+            ActivationOutcome::Silent(SilentReason::NotDue)
+        );
+        assert_eq!(state.lock().unwrap().preflights, 0);
+        assert_eq!(state.lock().unwrap().admissions, 0);
+        assert!(Store::open(path.clone())
+            .unwrap()
+            .dispatches(&objective_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger_counts(&path), (0, 0));
+    }
+}
+
+#[test]
+fn activation_boundary_requires_one_exact_uuid_root_and_canonical_member() {
+    let invalid_routes = [
+        vec![],
+        vec![boundary_routes()[0].clone(), boundary_routes()[0].clone()],
+        vec![CanonicalRoute {
+            channel_id: "not-a-uuid".into(),
+            ..boundary_routes()[0].clone()
+        }],
+        vec![CanonicalRoute {
+            thread_root_id: "bad-root".into(),
+            ..boundary_routes()[0].clone()
+        }],
+        vec![CanonicalRoute {
+            member_pubkeys: vec![OTHER_PUBKEY.into()],
+            ..boundary_routes()[0].clone()
+        }],
+    ];
+    for (index, routes) in invalid_routes.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-ACTIVATE-ROUTE-{index}");
+        let (mut boundary, state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            boundary_agent_records(),
+            routes,
+            [300],
+            BoundaryBehavior::Admitted,
+        );
+        assert_eq!(
+            boundary.coordinate(&objective_id, 1).unwrap(),
+            ActivationOutcome::Silent(SilentReason::NotDue)
+        );
+        assert_eq!(state.lock().unwrap().preflights, 0);
+        assert_eq!(state.lock().unwrap().admissions, 0);
+        assert!(Store::open(path.clone())
+            .unwrap()
+            .dispatches(&objective_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger_counts(&path), (0, 0));
+    }
+}
+
+#[test]
+fn activation_boundary_clock_is_trusted_monotonic_and_expiry_equality_is_expired() {
+    for (name, times) in [
+        ("negative", vec![-1]),
+        ("rollback", vec![300, 299]),
+        ("expiry-equality", vec![300, 360]),
+        ("overflow", vec![i64::MAX]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-ACTIVATE-CLOCK-{name}");
+        let (mut boundary, state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            boundary_agent_records(),
+            boundary_routes(),
+            times,
+            BoundaryBehavior::Admitted,
+        );
+        let outcome = boundary.coordinate(&objective_id, 1).unwrap();
+        match name {
+            "negative" | "overflow" => {
+                assert_eq!(outcome, ActivationOutcome::Silent(SilentReason::NotDue));
+                assert!(Store::open(path.clone())
+                    .unwrap()
+                    .dispatches(&objective_id)
+                    .unwrap()
+                    .is_empty());
+            }
+            "rollback" | "expiry-equality" => {
+                let rejected = match outcome {
+                    ActivationOutcome::Rejected(dispatch) => dispatch,
+                    other => panic!("expected claimed rejection, got {other:?}"),
+                };
+                assert_eq!(rejected.state, DispatchState::Claimed);
+                assert!(rejected.wake_intent_at.is_none());
+                assert_eq!(
+                    rejected.recovery_state.as_deref(),
+                    Some("ACTIVATION_CLAIMED")
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(state.lock().unwrap().admissions, 0);
+        assert_eq!(ledger_counts(&path), (0, 0));
+    }
+}
+
+#[test]
+fn activation_boundary_provider_circuit_is_open_before_but_closed_at_equality() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut setup = Store::open(path.clone()).unwrap();
+    setup
+        .create_active(active("REMH-ACTIVATE-CIRCUIT", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    setup
+        .create_active(active(
+            "REMH-ACTIVATE-CIRCUIT-FAIL",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let failed = reserve(&mut setup, "REMH-ACTIVATE-CIRCUIT-FAIL", 1, 300);
+    setup
+        .record_dispatch_failure(failed, "provider_down", 301, 900)
+        .unwrap();
+    drop(setup);
+
+    let (mut before, before_state) = activation_boundary_for(
+        &path,
+        "REMH-ACTIVATE-CIRCUIT",
+        boundary_agent_records(),
+        boundary_routes(),
+        [899],
+        BoundaryBehavior::Admitted,
+    );
+    assert_eq!(
+        before.coordinate("REMH-ACTIVATE-CIRCUIT", 1).unwrap(),
+        ActivationOutcome::Silent(SilentReason::ProviderCircuitOpen)
+    );
+    assert_eq!(before_state.lock().unwrap().preflights, 0);
+    drop(before);
+
+    let (mut equality, equality_state) = activation_boundary_for(
+        &path,
+        "REMH-ACTIVATE-CIRCUIT",
+        boundary_agent_records(),
+        boundary_routes(),
+        [900, 901, 902, 903],
+        BoundaryBehavior::Admitted,
+    );
+    assert!(matches!(
+        equality.coordinate("REMH-ACTIVATE-CIRCUIT", 1).unwrap(),
+        ActivationOutcome::Sent(_)
+    ));
+    assert_eq!(equality_state.lock().unwrap().admissions, 1);
+}
+
+#[test]
+fn exactly_one_contender_consumes_the_durable_activation_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut setup = Store::open(path.clone()).unwrap();
+    setup
+        .create_active(active("REMH-ACTIVATE-FENCE", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let dispatch_id = reserve(&mut setup, "REMH-ACTIVATE-FENCE", 1, 300);
+    setup
+        .claim_activation_dispatch(dispatch_id, "same-holder", 301, 400)
+        .unwrap();
+    let frozen = setup
+        .record_activation_wake_intent(
+            dispatch_id,
+            "same-holder",
+            WakeIntentInput {
+                target_agent_key: "fgd-smoke-agent",
+                target_pubkey: TARGET_PUBKEY,
+                channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0",
+                thread_root_id: THREAD_ROOT,
+                idempotency_key: "ready-race",
+                instruction: "Perform the isolated activation wake.",
+            },
+            302,
+        )
+        .unwrap();
+    assert_eq!(
+        frozen.recovery_state.as_deref(),
+        Some("FENCE_READY:ready-race")
+    );
+    drop(setup);
+
+    let state = Arc::new(Mutex::new(BoundaryAdapterState::default()));
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        let frozen = frozen.clone();
+        let state = state.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut store = Store::open(path).unwrap();
+            let mut adapter = TestActivationAdapter {
+                state,
+                preflight_failure: None,
+                behavior: BoundaryBehavior::Rejected,
+            };
+            barrier.wait();
+            admit_frozen(&mut store, &mut adapter, &frozen, 303).unwrap()
+        }));
+    }
+    barrier.wait();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, adapter_result)| adapter_result.is_some())
+            .count(),
+        1
+    );
+    assert_eq!(state.lock().unwrap().admissions, 1);
+    assert!(results.iter().all(|(dispatch, _)| {
+        dispatch.recovery_state.as_deref() == Some("FENCE_SPENT:ready-race")
+    }));
+}
+
+#[test]
+fn activation_boundary_crash_points_are_uncertain_and_never_replayed() {
+    for (name, behavior, expected_external_calls) in [
+        ("before", BoundaryBehavior::PanicBeforeExternalCall, 0),
+        ("after", BoundaryBehavior::PanicAfterExternalCall, 1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-ACTIVATE-CRASH-{name}");
+        let (mut boundary, state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            boundary_agent_records(),
+            boundary_routes(),
+            [300, 301, 302],
+            behavior,
+        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boundary.coordinate(&objective_id, 1)
+        }))
+        .is_err());
+        assert_eq!(state.lock().unwrap().admissions, expected_external_calls);
+        drop(boundary);
+
+        let mut reopened = Store::open(path.clone()).unwrap();
+        let reconciled = reopened
+            .reconcile_activation_startup("relay", "1", &[], 1_000, 900)
+            .unwrap();
+        assert!(reconciled.wake_dispatches.is_empty());
+        let dispatch = reopened.dispatches(&objective_id).unwrap().remove(0);
+        assert_eq!(dispatch.state, DispatchState::VerifyBeforeRetry);
+        assert_eq!(
+            reopened
+                .evaluate(&objective_id, 1, 1_001, "fgd-smoke-agent")
+                .unwrap(),
+            Evaluation::Silent(SilentReason::AlreadyIntervened)
+        );
+    }
+}
+
+#[test]
+fn activation_reconnect_cursor_and_exact_ack_are_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let (mut boundary, _) = activation_boundary_for(
+        &path,
+        "REMH-ACTIVATE-ACK",
+        boundary_agent_records(),
+        boundary_routes(),
+        [300, 301, 302, 303],
+        BoundaryBehavior::Admitted,
+    );
+    let sent = match boundary.coordinate("REMH-ACTIVATE-ACK", 1).unwrap() {
+        ActivationOutcome::Sent(dispatch) => dispatch,
+        other => panic!("expected sent activation, got {other:?}"),
+    };
+    drop(boundary);
+    let event = SignedAckEvent {
+        event_id: "activation-ack-event",
+        author_pubkey: TARGET_PUBKEY,
+        channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0",
+        thread_root_id: THREAD_ROOT,
+        content: sent.ack_marker.as_deref().unwrap(),
+        created_at: 303,
+    };
+    let mut reopened = Store::open(path.clone()).unwrap();
+    let first = reopened
+        .reconcile_activation_startup("relay", "1", &[event.clone()], 1_000, 900)
+        .unwrap();
+    assert_eq!(first.acknowledged, vec![sent.id]);
+    let replay = reopened
+        .reconcile_activation_startup("relay", "1", &[event], 1_001, 901)
+        .unwrap();
+    assert!(replay.acknowledged.is_empty());
+    assert!(replay.wake_dispatches.is_empty());
+    assert_eq!(
+        reopened.activation_cursor("relay").unwrap().as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        reopened.dispatch(sent.id).unwrap().unwrap().state,
+        DispatchState::Acked
+    );
+}
+
+#[test]
+fn activation_same_cursor_restart_still_recovers_claims_and_quarantines_old_wake_intents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    store
+        .reconcile_activation_startup("relay", "7", &[], 200, 100)
+        .unwrap();
+
+    store
+        .create_active(active(
+            "REMH-ACTIVATE-STALE-CLAIM",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let claimed = reserve(&mut store, "REMH-ACTIVATE-STALE-CLAIM", 1, 300);
+    store
+        .claim_activation_dispatch(claimed, "stale-holder", 301, 350)
+        .unwrap();
+
+    store
+        .create_active(active(
+            "REMH-ACTIVATE-OLD-WAKE",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let old_wake = reserve(&mut store, "REMH-ACTIVATE-OLD-WAKE", 1, 300);
+    store
+        .claim_activation_dispatch(old_wake, "old-wake-holder", 301, 400)
+        .unwrap();
+    store
+        .record_activation_wake_intent(
+            old_wake,
+            "old-wake-holder",
+            WakeIntentInput {
+                target_agent_key: "fgd-smoke-agent",
+                target_pubkey: TARGET_PUBKEY,
+                channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0",
+                thread_root_id: THREAD_ROOT,
+                idempotency_key: "old-wake",
+                instruction: "Perform the isolated activation wake.",
+            },
+            302,
+        )
+        .unwrap();
+    store
+        .record_verified_progress(proof("REMH-ACTIVATE-OLD-WAKE", 400, 500))
+        .unwrap();
+
+    let reconciled = store
+        .reconcile_activation_startup("relay", "7", &[], 500, 400)
+        .unwrap();
+    assert!(reconciled.acknowledged.is_empty());
+    assert!(reconciled.wake_dispatches.is_empty());
+
+    let recovered = store.dispatch(claimed).unwrap().unwrap();
+    assert_eq!(recovered.state, DispatchState::Pending);
+    assert_eq!(
+        recovered.recovery_state.as_deref(),
+        Some("STALE_CLAIM_RECOVERED")
+    );
+    let quarantined = store.dispatch(old_wake).unwrap().unwrap();
+    assert_eq!(quarantined.objective_generation, 1);
+    assert_eq!(quarantined.state, DispatchState::VerifyBeforeRetry);
+    assert_eq!(
+        quarantined.recovery_state.as_deref(),
+        Some("UNCERTAIN_WAKE_BOUNDARY")
+    );
+    assert_eq!(
+        store.activation_cursor("relay").unwrap().as_deref(),
+        Some("7")
+    );
+}
+
+#[test]
+fn activation_local_rejection_provider_failure_and_post_fence_results_have_distinct_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    for behavior in [
+        BoundaryBehavior::Rejected,
+        BoundaryBehavior::Error,
+        BoundaryBehavior::Timeout,
+    ] {
+        let objective_id = format!("REMH-ACTIVATE-POST-FENCE-{behavior:?}");
+        let (mut boundary, state) = activation_boundary_for(
+            &path,
+            &objective_id,
+            boundary_agent_records(),
+            boundary_routes(),
+            [300, 301, 302],
+            behavior,
+        );
+        let dispatch = match boundary.coordinate(&objective_id, 1).unwrap() {
+            ActivationOutcome::Uncertain(dispatch) => dispatch,
+            other => panic!("expected uncertain post-fence result, got {other:?}"),
+        };
+        assert_eq!(dispatch.state, DispatchState::WakeIntent);
+        let expected_fence = format!(
+            "FENCE_SPENT:{}",
+            dispatch.idempotency_key.as_deref().unwrap()
+        );
+        assert_eq!(
+            dispatch.recovery_state.as_deref(),
+            Some(expected_fence.as_str())
+        );
+        assert_eq!(state.lock().unwrap().admissions, 1);
+        assert_eq!(ledger_counts(&path).0, 0);
+    }
+
+    let provider_id = "REMH-ACTIVATE-PROVIDER-FAIL";
+    let (mut provider, provider_state) = activation_boundary_for(
+        &path,
+        provider_id,
+        boundary_agent_records(),
+        boundary_routes(),
+        [400],
+        BoundaryBehavior::Admitted,
+    );
+    provider.adapter_mut().preflight_failure = Some(AdapterFailure {
+        code: "provider_unavailable".into(),
+        open_for: 60,
+    });
+    assert!(matches!(
+        provider.coordinate(provider_id, 1).unwrap(),
+        ActivationOutcome::Failed(_)
+    ));
+    assert_eq!(provider_state.lock().unwrap().preflights, 1);
+    assert_eq!(provider_state.lock().unwrap().admissions, 0);
+    assert!(Store::open(path)
+        .unwrap()
+        .provider_circuit("REMH")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn activation_boundary_is_generation_silent_terminal_and_has_no_human_or_production_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let (mut boundary, state) = activation_boundary_for(
+        &path,
+        "REMH-ACTIVATE-SILENT",
+        vec![],
+        boundary_routes(),
+        [300],
+        BoundaryBehavior::Admitted,
+    );
+    assert_eq!(
+        boundary.coordinate("REMH-ACTIVATE-SILENT", 0).unwrap(),
+        ActivationOutcome::Silent(SilentReason::StaleGeneration)
+    );
+    assert_eq!(state.lock().unwrap().preflights, 0);
+    assert_eq!(
+        boundary.coordinate("REMH-ACTIVATE-SILENT", 1).unwrap(),
+        ActivationOutcome::Silent(SilentReason::NotDue)
+    );
+    assert_eq!(
+        boundary.coordinate("REMH-ACTIVATE-SILENT", 1).unwrap(),
+        ActivationOutcome::Silent(SilentReason::NotDue)
+    );
+    assert!(boundary
+        .store()
+        .dispatches("REMH-ACTIVATE-SILENT")
+        .unwrap()
+        .is_empty());
+
+    let source = include_str!("activation_boundary.rs");
+    for forbidden in [
+        "admit_human_authority",
+        "route_blocker",
+        "ready_for_owner_test",
+        "tauri::command",
+        "WakeAdapter",
+        "relay_",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "found forbidden surface: {forbidden}"
+        );
+    }
+    let native_lib = include_str!("../lib.rs");
+    assert!(native_lib.contains("#[cfg(test)]\nmod control_plane;"));
+    assert!(!native_lib.contains("activation_boundary"));
+}
+
+fn ready_activation(
+    store: &mut Store,
+    objective_id: &str,
+    holder: &str,
+    key: &str,
+    claimed_at: i64,
+    expires_at: i64,
+    frozen_at: i64,
+) -> super::store::Dispatch {
+    store
+        .create_active(active(objective_id, "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let id = reserve(store, objective_id, 1, 300);
+    store
+        .claim_activation_dispatch(id, holder, claimed_at, expires_at)
+        .unwrap();
+    store
+        .record_activation_wake_intent(
+            id,
+            holder,
+            WakeIntentInput {
+                target_agent_key: "fgd-smoke-agent",
+                target_pubkey: TARGET_PUBKEY,
+                channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0",
+                thread_root_id: THREAD_ROOT,
+                idempotency_key: key,
+                instruction: "Perform the isolated activation wake.",
+            },
+            frozen_at,
+        )
+        .unwrap()
+}
+
+#[derive(Clone)]
+struct ScriptedAgentDirectory {
+    records: VecDeque<Vec<AgentRecord>>,
+}
+
+impl AgentDirectory for ScriptedAgentDirectory {
+    fn records_for(&mut self, _agent_key: &str) -> super::store::Result<Vec<AgentRecord>> {
+        self.records
+            .pop_front()
+            .ok_or_else(|| "scripted agent directory exhausted".into())
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedRouteDirectory {
+    routes: VecDeque<Vec<CanonicalRoute>>,
+}
+
+impl RouteDirectory for ScriptedRouteDirectory {
+    fn routes_for(&mut self, _objective_id: &str) -> super::store::Result<Vec<CanonicalRoute>> {
+        self.routes
+            .pop_front()
+            .ok_or_else(|| "scripted route directory exhausted".into())
+    }
+}
+
+#[test]
+fn activation_claim_recovery_and_release_are_isolated_from_legacy_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut setup = Store::open(path.clone()).unwrap();
+    for objective_id in ["REMH-ACTIVATION-CLAIM", "REMH-LEGACY-CLAIM"] {
+        setup
+            .create_active(active(objective_id, "fgd-smoke-agent", 100, 200))
+            .unwrap();
+    }
+    let activation = reserve(&mut setup, "REMH-ACTIVATION-CLAIM", 1, 300);
+    let legacy = reserve(&mut setup, "REMH-LEGACY-CLAIM", 1, 300);
+    let activation_claim = setup
+        .claim_activation_dispatch(activation, "activation-holder", 301, 350)
+        .unwrap();
+    assert_eq!(
+        activation_claim.recovery_state.as_deref(),
+        Some("ACTIVATION_CLAIMED")
+    );
+    setup
+        .claim_dispatch(legacy, "legacy-holder", 301, 350)
+        .unwrap();
+    assert!(setup
+        .record_activation_wake_intent(
+            legacy,
+            "legacy-holder",
+            WakeIntentInput {
+                target_agent_key: "fgd-smoke-agent",
+                target_pubkey: TARGET_PUBKEY,
+                channel_id: "51d885db-c687-44a6-8f2c-01bd679e7bb0",
+                thread_root_id: THREAD_ROOT,
+                idempotency_key: "legacy-must-not-freeze",
+                instruction: "Must remain legacy.",
+            },
+            302,
+        )
+        .is_err());
+    drop(setup);
+
+    let (mut boundary, _) = activation_boundary_for(
+        &path,
+        "REMH-ACTIVATION-CLAIM",
+        boundary_agent_records(),
+        boundary_routes(),
+        [400],
+        BoundaryBehavior::Admitted,
+    );
+    assert_eq!(boundary.recover_expired_claims().unwrap(), 1);
+    let recovered = boundary.store().dispatch(activation).unwrap().unwrap();
+    assert_eq!(recovered.state, DispatchState::Pending);
+    assert_eq!(
+        recovered.recovery_state.as_deref(),
+        Some("STALE_CLAIM_RECOVERED")
+    );
+    let legacy_claim = boundary.store().dispatch(legacy).unwrap().unwrap();
+    assert_eq!(legacy_claim.state, DispatchState::Claimed);
+    assert!(legacy_claim.recovery_state.is_none());
+}
+
+#[test]
+fn activation_pre_freeze_release_is_guarded_and_preclaim_failure_preserves_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut setup = Store::open(path.clone()).unwrap();
+    setup
+        .create_active(active("REMH-PRECLAIM-PENDING", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let pending = reserve(&mut setup, "REMH-PRECLAIM-PENDING", 1, 300);
+    drop(setup);
+
+    let (mut rejected, _) = activation_boundary_for(
+        &path,
+        "REMH-PRECLAIM-PENDING",
+        vec![],
+        boundary_routes(),
+        [301],
+        BoundaryBehavior::Admitted,
+    );
+    let outcome = rejected.coordinate("REMH-PRECLAIM-PENDING", 1).unwrap();
+    let returned = match outcome {
+        ActivationOutcome::Rejected(dispatch) => dispatch,
+        other => panic!("expected pending rejection, got {other:?}"),
+    };
+    assert_eq!(returned.id, pending);
+    assert_eq!(returned.state, DispatchState::Pending);
+    assert!(returned.lease_holder.is_none());
+    drop(rejected);
+
+    let store = Store::open(path.clone()).unwrap();
+    let state = Arc::new(Mutex::new(BoundaryAdapterState::default()));
+    let mut boundary = ActivationBoundary::new(
+        store,
+        ScriptedAgentDirectory {
+            records: VecDeque::from([
+                boundary_agent_records(),
+                vec![AgentRecord {
+                    active: false,
+                    ..boundary_agent_records()[0].clone()
+                }],
+            ]),
+        },
+        TestRouteDirectory {
+            routes: boundary_routes(),
+        },
+        TestClock::new([302, 303]),
+        TestActivationAdapter {
+            state,
+            preflight_failure: None,
+            behavior: BoundaryBehavior::Admitted,
+        },
+        "release-holder",
+    );
+    let released = match boundary.coordinate("REMH-PRECLAIM-PENDING", 1).unwrap() {
+        ActivationOutcome::Rejected(dispatch) => dispatch,
+        other => panic!("expected guarded release, got {other:?}"),
+    };
+    assert_eq!(released.state, DispatchState::Pending);
+    assert!(released.lease_holder.is_none());
+    assert!(released.recovery_state.is_none());
+}
+
+#[test]
+fn final_route_mismatch_returns_fresh_blocked_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut changed_route = boundary_routes()[0].clone();
+    changed_route.thread_root_id = OTHER_ROOT.into();
+    let state = Arc::new(Mutex::new(BoundaryAdapterState::default()));
+    let mut store = Store::open(path.clone()).unwrap();
+    store
+        .create_active(active("REMH-FINAL-ROUTE", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let mut boundary = ActivationBoundary::new(
+        store,
+        TestAgentDirectory {
+            records: boundary_agent_records(),
+        },
+        ScriptedRouteDirectory {
+            routes: VecDeque::from([boundary_routes(), boundary_routes(), vec![changed_route]]),
+        },
+        TestClock::new([300, 301, 302]),
+        TestActivationAdapter {
+            state: state.clone(),
+            preflight_failure: None,
+            behavior: BoundaryBehavior::Admitted,
+        },
+        "route-holder",
+    );
+    let blocked = match boundary.coordinate("REMH-FINAL-ROUTE", 1).unwrap() {
+        ActivationOutcome::Uncertain(dispatch) => dispatch,
+        other => panic!("expected blocked uncertainty, got {other:?}"),
+    };
+    let expected = format!(
+        "FENCE_BLOCKED:{}",
+        blocked.idempotency_key.as_deref().unwrap()
+    );
+    assert_eq!(blocked.recovery_state.as_deref(), Some(expected.as_str()));
+    assert_eq!(state.lock().unwrap().admissions, 0);
+}
+
+#[test]
+fn final_predicate_failures_block_permanently_and_repaired_conditions_cannot_consume() {
+    for case in ["expiry", "stale-generation", "inactive", "circuit-open"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-plane.sqlite3");
+        let objective_id = format!("REMH-FINAL-PREDICATE-{case}");
+        let mut store = Store::open(path.clone()).unwrap();
+        let frozen = ready_activation(
+            &mut store,
+            &objective_id,
+            "predicate-holder",
+            case,
+            301,
+            400,
+            302,
+        );
+        let binding = super::activation_boundary::fence_binding(&frozen).unwrap();
+        let admission_at = match case {
+            "expiry" => 400,
+            "stale-generation" => {
+                store
+                    .record_verified_progress(proof(&objective_id, 350, 450))
+                    .unwrap();
+                351
+            }
+            "inactive" => {
+                admit_owner_decision(&mut store, &objective_id, 1, "authority:inactive", 350);
+                store
+                    .route_blocker(BlockerInput {
+                        objective_id: &objective_id,
+                        expected_generation: 1,
+                        route: BlockerRoute::HumanOwner,
+                        diagnosed_at: 351,
+                        reference: "gate:inactive-final-predicate",
+                        authority_admission_reference: Some("authority:inactive"),
+                    })
+                    .unwrap();
+                352
+            }
+            "circuit-open" => {
+                let failure_id = format!("{objective_id}-FAILURE");
+                store
+                    .create_active(active(&failure_id, "fgd-smoke-agent", 100, 200))
+                    .unwrap();
+                let failed = reserve(&mut store, &failure_id, 1, 303);
+                store
+                    .record_dispatch_failure(failed, "provider_down", 304, 500)
+                    .unwrap();
+                305
+            }
+            _ => unreachable!(),
+        };
+        assert!(store
+            .consume_activation_fence(&binding, admission_at)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .block_activation_fence_if_invalid(&binding, admission_at, false)
+            .unwrap());
+        let blocked = store.dispatch(frozen.id).unwrap().unwrap();
+        assert_eq!(
+            blocked.recovery_state.as_deref(),
+            Some(format!("FENCE_BLOCKED:{case}").as_str())
+        );
+        assert!(store
+            .consume_activation_fence(&binding, 1_000)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn activation_reconcile_requires_spent_and_isolates_legacy_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path.clone()).unwrap();
+    let ready = ready_activation(
+        &mut store,
+        "REMH-ACK-READY",
+        "holder",
+        "ack-ready",
+        301,
+        500,
+        302,
+    );
+    let blocked = ready_activation(
+        &mut store,
+        "REMH-ACK-BLOCKED",
+        "holder",
+        "ack-blocked",
+        301,
+        500,
+        302,
+    );
+    let blocked_binding = super::activation_boundary::fence_binding(&blocked).unwrap();
+    assert!(store
+        .block_activation_fence_if_invalid(&blocked_binding, 303, true)
+        .unwrap());
+    let spent = ready_activation(
+        &mut store,
+        "REMH-ACK-SPENT",
+        "holder",
+        "ack-spent",
+        301,
+        500,
+        302,
+    );
+    let spent_binding = super::activation_boundary::fence_binding(&spent).unwrap();
+    assert!(store
+        .consume_activation_fence(&spent_binding, 303)
+        .unwrap()
+        .is_some());
+
+    store
+        .create_active(active(
+            "REMH-LEGACY-WAKE-ISOLATION",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let legacy_wake = reserve(&mut store, "REMH-LEGACY-WAKE-ISOLATION", 1, 300);
+    freeze(&mut store, legacy_wake, 301, "legacy-wake-isolation");
+    store
+        .create_active(active(
+            "REMH-LEGACY-SENT-ISOLATION",
+            "fgd-smoke-agent",
+            100,
+            200,
+        ))
+        .unwrap();
+    let legacy_sent = reserve(&mut store, "REMH-LEGACY-SENT-ISOLATION", 1, 300);
+    freeze(&mut store, legacy_sent, 301, "legacy-sent-isolation");
+    store.record_sent(legacy_sent, 303).unwrap();
+
+    let legacy_wake_dispatch = store.dispatch(legacy_wake).unwrap().unwrap();
+    let legacy_sent_dispatch = store.dispatch(legacy_sent).unwrap().unwrap();
+    let events = [
+        activation_ack("ready-ack", ready.ack_marker.as_deref().unwrap(), 304),
+        activation_ack("blocked-ack", blocked.ack_marker.as_deref().unwrap(), 304),
+        activation_ack("spent-ack", spent.ack_marker.as_deref().unwrap(), 304),
+        ack(
+            "legacy-wake-ack",
+            legacy_wake_dispatch.ack_marker.as_deref().unwrap(),
+            304,
+        ),
+        ack(
+            "legacy-sent-ack",
+            legacy_sent_dispatch.ack_marker.as_deref().unwrap(),
+            304,
+        ),
+    ];
+    let reconciled = store
+        .reconcile_activation_startup("relay", "1", &events, 600, 500)
+        .unwrap();
+    assert_eq!(reconciled.acknowledged, vec![spent.id]);
+    assert_eq!(
+        store.dispatch(spent.id).unwrap().unwrap().state,
+        DispatchState::Acked
+    );
+    for id in [ready.id, blocked.id] {
+        assert_eq!(
+            store.dispatch(id).unwrap().unwrap().state,
+            DispatchState::VerifyBeforeRetry
+        );
+    }
+    assert_eq!(
+        store.dispatch(legacy_wake).unwrap().unwrap().state,
+        DispatchState::WakeIntent
+    );
+    assert_eq!(
+        store.dispatch(legacy_sent).unwrap().unwrap().state,
+        DispatchState::Sent
+    );
+}
+
+#[test]
+fn legacy_reconcile_ack_excludes_all_activation_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    let ready = ready_activation(
+        &mut store,
+        "REMH-LEGACY-ACK-READY",
+        "holder",
+        "legacy-ack-ready",
+        301,
+        500,
+        302,
+    );
+    let blocked = ready_activation(
+        &mut store,
+        "REMH-LEGACY-ACK-BLOCKED",
+        "holder",
+        "legacy-ack-blocked",
+        301,
+        500,
+        302,
+    );
+    let blocked_binding = super::activation_boundary::fence_binding(&blocked).unwrap();
+    store
+        .block_activation_fence_if_invalid(&blocked_binding, 303, true)
+        .unwrap();
+    let spent = ready_activation(
+        &mut store,
+        "REMH-LEGACY-ACK-SPENT",
+        "holder",
+        "legacy-ack-spent",
+        301,
+        500,
+        302,
+    );
+    let spent_binding = super::activation_boundary::fence_binding(&spent).unwrap();
+    store.consume_activation_fence(&spent_binding, 303).unwrap();
+    let events = [
+        activation_ack(
+            "legacy-path-ready",
+            ready.ack_marker.as_deref().unwrap(),
+            304,
+        ),
+        activation_ack(
+            "legacy-path-blocked",
+            blocked.ack_marker.as_deref().unwrap(),
+            304,
+        ),
+        activation_ack(
+            "legacy-path-spent",
+            spent.ack_marker.as_deref().unwrap(),
+            304,
+        ),
+    ];
+    let before = [ready.id, blocked.id, spent.id].map(|id| store.dispatch(id).unwrap().unwrap());
+    let reconciled = store.reconcile_startup(&events, 600, 500).unwrap();
+    assert!(reconciled.acknowledged.is_empty());
+    for (expected, marker) in before.iter().zip([
+        "FENCE_READY:legacy-ack-ready",
+        "FENCE_BLOCKED:legacy-ack-blocked",
+        "FENCE_SPENT:legacy-ack-spent",
+    ]) {
+        let after = store.dispatch(expected.id).unwrap().unwrap();
+        assert_eq!(&after, expected);
+        assert_eq!(after.state, DispatchState::WakeIntent);
+        assert_eq!(after.recovery_state.as_deref(), Some(marker));
+        assert!(after.ack_event_id.is_none());
+    }
+}
+
+#[test]
+fn activation_restart_quarantines_ready_blocked_and_spent_all_generations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    store
+        .reconcile_activation_startup("relay", "7", &[], 200, 100)
+        .unwrap();
+    let ready = ready_activation(
+        &mut store,
+        "REMH-RESTART-READY",
+        "holder",
+        "restart-ready",
+        301,
+        500,
+        302,
+    );
+    let blocked = ready_activation(
+        &mut store,
+        "REMH-RESTART-BLOCKED",
+        "holder",
+        "restart-blocked",
+        301,
+        500,
+        302,
+    );
+    let blocked_binding = super::activation_boundary::fence_binding(&blocked).unwrap();
+    store
+        .block_activation_fence_if_invalid(&blocked_binding, 303, true)
+        .unwrap();
+    let spent = ready_activation(
+        &mut store,
+        "REMH-RESTART-SPENT",
+        "holder",
+        "restart-spent",
+        301,
+        500,
+        302,
+    );
+    let spent_binding = super::activation_boundary::fence_binding(&spent).unwrap();
+    store.consume_activation_fence(&spent_binding, 303).unwrap();
+    store
+        .record_verified_progress(proof("REMH-RESTART-READY", 400, 500))
+        .unwrap();
+
+    store
+        .reconcile_activation_startup("relay", "7", &[], 600, 500)
+        .unwrap();
+    for id in [ready.id, blocked.id, spent.id] {
+        let dispatch = store.dispatch(id).unwrap().unwrap();
+        assert_eq!(dispatch.state, DispatchState::VerifyBeforeRetry);
+        assert_eq!(
+            dispatch.recovery_state.as_deref(),
+            Some("UNCERTAIN_WAKE_BOUNDARY")
+        );
+    }
+}
+
+#[test]
+fn activation_reconcile_rejects_inverted_stale_claim_window_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control-plane.sqlite3");
+    let mut store = Store::open(path).unwrap();
+    store
+        .create_active(active("REMH-INVERTED-WINDOW", "fgd-smoke-agent", 100, 200))
+        .unwrap();
+    let id = reserve(&mut store, "REMH-INVERTED-WINDOW", 1, 300);
+    store
+        .claim_activation_dispatch(id, "holder", 301, 500)
+        .unwrap();
+    let before = store.dispatch(id).unwrap().unwrap();
+    assert!(store
+        .reconcile_activation_startup("relay", "1", &[], 400, 401)
+        .is_err());
+    assert_eq!(store.dispatch(id).unwrap().unwrap(), before);
+    assert!(store.activation_cursor("relay").unwrap().is_none());
 }

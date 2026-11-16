@@ -211,11 +211,14 @@ pub(super) struct Dispatch {
     pub idempotency_key: Option<String>,
     pub ack_marker: Option<String>,
     pub wake_payload: Option<String>,
+    pub lease_holder: Option<String>,
     pub claimed_at: Option<i64>,
+    pub claim_expires_at: Option<i64>,
     pub wake_intent_at: Option<i64>,
     pub sent_at: Option<i64>,
     pub ack_event_id: Option<String>,
     pub acknowledged_at: Option<i64>,
+    pub recovery_state: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -227,6 +230,19 @@ pub(super) struct WakeIntentInput<'a> {
     pub thread_root_id: &'a str,
     pub idempotency_key: &'a str,
     pub instruction: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ActivationFenceBinding {
+    pub dispatch_id: i64,
+    pub objective_id: String,
+    pub generation: i64,
+    pub holder: String,
+    pub target_agent_key: String,
+    pub target_pubkey: String,
+    pub channel_id: String,
+    pub thread_root_id: String,
+    pub idempotency_key: String,
 }
 
 pub(super) struct SmokePrepareInput<'a> {
@@ -849,7 +865,7 @@ impl Store {
         database(
             self.connection
                 .query_row(
-                    "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,claimed_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,created_at,updated_at FROM dispatch_outbox WHERE id=?1",
+                    "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,lease_holder,claimed_at,claim_expires_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,recovery_state,created_at,updated_at FROM dispatch_outbox WHERE id=?1",
                     [dispatch_id],
                     dispatch_row,
                 )
@@ -865,7 +881,7 @@ impl Store {
         database(
             self.connection
                 .query_row(
-                    "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,claimed_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,created_at,updated_at FROM dispatch_outbox WHERE objective_id=?1 AND objective_generation=?2",
+                    "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,lease_holder,claimed_at,claim_expires_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,recovery_state,created_at,updated_at FROM dispatch_outbox WHERE objective_id=?1 AND objective_generation=?2",
                     params![objective_id, generation],
                     dispatch_row,
                 )
@@ -875,7 +891,7 @@ impl Store {
 
     pub(super) fn dispatches(&self, objective_id: &str) -> Result<Vec<Dispatch>> {
         let mut statement = database(self.connection.prepare(
-            "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,claimed_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,created_at,updated_at FROM dispatch_outbox WHERE objective_id=?1 ORDER BY id",
+            "SELECT id,objective_id,objective_generation,attempt,state,target_agent_key,target_pubkey,channel_id,thread_root_id,idempotency_key,ack_marker,wake_payload,lease_holder,claimed_at,claim_expires_at,wake_intent_at,sent_at,ack_event_id,acknowledged_at,recovery_state,created_at,updated_at FROM dispatch_outbox WHERE objective_id=?1 ORDER BY id",
         ))?;
         let rows = database(statement.query_map([objective_id], dispatch_row))?;
         database(rows.collect())
@@ -1032,6 +1048,168 @@ impl Store {
             .ok_or("Control-plane dispatch disappeared".into())
     }
 
+    pub(super) fn claim_activation_dispatch(
+        &mut self,
+        dispatch_id: i64,
+        holder: &str,
+        claimed_at: i64,
+        expires_at: i64,
+    ) -> Result<Dispatch> {
+        if holder.is_empty() || holder.len() > 256 || expires_at <= claimed_at {
+            return Err("Invalid activation dispatch claim".into());
+        }
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let changed = database(tx.execute(
+            "UPDATE dispatch_outbox SET state='CLAIMED',lease_holder=?2,claimed_at=?3,claim_expires_at=?4,recovery_state='ACTIVATION_CLAIMED',updated_at=?3 WHERE id=?1 AND state='PENDING' AND EXISTS(SELECT 1 FROM objectives o WHERE o.objective_id=dispatch_outbox.objective_id AND o.state='ACTIVE' AND o.generation=dispatch_outbox.objective_generation AND NOT EXISTS(SELECT 1 FROM provider_circuits p WHERE p.client_scope=o.client_scope AND p.open_until>?3))",
+            params![dispatch_id,holder,claimed_at,expires_at],
+        ))?;
+        if changed != 1 {
+            return Err("Activation dispatch is not available to claim".into());
+        }
+        database(tx.commit())?;
+        self.dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch disappeared".into())
+    }
+
+    pub(super) fn release_activation_claim(
+        &mut self,
+        dispatch_id: i64,
+        holder: &str,
+        released_at: i64,
+    ) -> Result<Dispatch> {
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let changed = database(tx.execute(
+            "UPDATE dispatch_outbox SET state='PENDING',lease_holder=NULL,claimed_at=NULL,claim_expires_at=NULL,recovery_state=NULL,error_code=NULL,updated_at=?3 WHERE id=?1 AND state='CLAIMED' AND lease_holder=?2 AND recovery_state='ACTIVATION_CLAIMED' AND wake_intent_at IS NULL",
+            params![dispatch_id, holder, released_at],
+        ))?;
+        if changed != 1 {
+            return Err("Activation claim could not be released by its holder".into());
+        }
+        database(tx.commit())?;
+        self.dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch disappeared".into())
+    }
+
+    pub(super) fn recover_expired_activation_claims(&mut self, now: i64) -> Result<usize> {
+        if now < 0 {
+            return Err("Invalid trusted recovery time".into());
+        }
+        database(self.connection.execute(
+            "UPDATE dispatch_outbox SET state='PENDING',lease_holder=NULL,claimed_at=NULL,claim_expires_at=NULL,recovery_state='STALE_CLAIM_RECOVERED',updated_at=?1 WHERE state='CLAIMED' AND recovery_state='ACTIVATION_CLAIMED' AND wake_intent_at IS NULL AND claim_expires_at<=?1",
+            [now],
+        ))
+    }
+
+    pub(super) fn record_activation_wake_intent(
+        &mut self,
+        dispatch_id: i64,
+        holder: &str,
+        input: WakeIntentInput<'_>,
+        wake_intent_at: i64,
+    ) -> Result<Dispatch> {
+        validate_wake_intent(holder, &input)?;
+        let dispatch = self
+            .dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch not found")?;
+        if dispatch.state != DispatchState::Claimed
+            || dispatch.target_agent_key != input.target_agent_key
+        {
+            return Err("Only the claimed target may cross the wake boundary".into());
+        }
+        let marker = format!(
+            "FGD_ACK:{}:{}:{}",
+            dispatch.objective_id, dispatch.attempt, input.idempotency_key
+        );
+        let payload = format!(
+            "{}\n\nAfter handling this wake, return exactly this marker as your final response:\n{}",
+            input.instruction, marker
+        );
+        let fence = format!("FENCE_READY:{}", input.idempotency_key);
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let changed = database(tx.execute(
+            "UPDATE dispatch_outbox SET state='WAKE_INTENT',target_pubkey=?3,channel_id=?4,thread_root_id=?5,idempotency_key=?6,ack_marker=?7,wake_payload=?8,wake_intent_at=?9,recovery_state=?10,error_code=NULL,updated_at=?9 WHERE id=?1 AND state='CLAIMED' AND lease_holder=?2 AND recovery_state='ACTIVATION_CLAIMED' AND claim_expires_at>?9 AND EXISTS(SELECT 1 FROM objectives o WHERE o.objective_id=dispatch_outbox.objective_id AND o.state='ACTIVE' AND o.generation=dispatch_outbox.objective_generation AND NOT EXISTS(SELECT 1 FROM provider_circuits p WHERE p.client_scope=o.client_scope AND p.open_until>?9))",
+            params![dispatch_id,holder,input.target_pubkey,input.channel_id,input.thread_root_id,input.idempotency_key,marker,payload,wake_intent_at,fence],
+        ))?;
+        if changed != 1 {
+            return Err("Activation wake intent was not frozen".into());
+        }
+        database(tx.commit())?;
+        self.dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch disappeared".into())
+    }
+
+    pub(super) fn consume_activation_fence(
+        &mut self,
+        binding: &ActivationFenceBinding,
+        now: i64,
+    ) -> Result<Option<ActivationFenceBinding>> {
+        if now < 0 {
+            return Err("Invalid trusted admission time".into());
+        }
+        let ready = format!("FENCE_READY:{}", binding.idempotency_key);
+        let spent = format!("FENCE_SPENT:{}", binding.idempotency_key);
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let changed = database(tx.execute(
+            "UPDATE dispatch_outbox SET recovery_state=?11,updated_at=?12 WHERE id=?1 AND objective_id=?2 AND objective_generation=?3 AND state='WAKE_INTENT' AND lease_holder=?4 AND claim_expires_at>?12 AND target_agent_key=?5 AND target_pubkey=?6 AND channel_id=?7 AND thread_root_id=?8 AND idempotency_key=?9 AND recovery_state=?10 AND EXISTS(SELECT 1 FROM objectives o WHERE o.objective_id=?2 AND o.state='ACTIVE' AND o.generation=?3 AND NOT EXISTS(SELECT 1 FROM provider_circuits p WHERE p.client_scope=o.client_scope AND p.open_until>?12))",
+            params![binding.dispatch_id,binding.objective_id,binding.generation,binding.holder,binding.target_agent_key,binding.target_pubkey,binding.channel_id,binding.thread_root_id,binding.idempotency_key,ready,spent,now],
+        ))?;
+        database(tx.commit())?;
+        Ok((changed == 1).then(|| binding.clone()))
+    }
+
+    pub(super) fn block_activation_fence_if_invalid(
+        &mut self,
+        binding: &ActivationFenceBinding,
+        now: i64,
+        authority_invalid: bool,
+    ) -> Result<bool> {
+        if now < 0 {
+            return Err("Invalid trusted admission time".into());
+        }
+        let ready = format!("FENCE_READY:{}", binding.idempotency_key);
+        let blocked = format!("FENCE_BLOCKED:{}", binding.idempotency_key);
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let changed = database(tx.execute(
+            "UPDATE dispatch_outbox SET recovery_state=?11,updated_at=?12 WHERE id=?1 AND objective_id=?2 AND objective_generation=?3 AND state='WAKE_INTENT' AND lease_holder=?13 AND target_agent_key=?4 AND target_pubkey=?5 AND channel_id=?6 AND thread_root_id=?7 AND idempotency_key=?8 AND recovery_state=?9 AND (?10=1 OR claim_expires_at<=?12 OR NOT EXISTS(SELECT 1 FROM objectives o WHERE o.objective_id=?2 AND o.state='ACTIVE' AND o.generation=?3 AND NOT EXISTS(SELECT 1 FROM provider_circuits p WHERE p.client_scope=o.client_scope AND p.open_until>?12)))",
+            params![binding.dispatch_id,binding.objective_id,binding.generation,binding.target_agent_key,binding.target_pubkey,binding.channel_id,binding.thread_root_id,binding.idempotency_key,ready,i64::from(authority_invalid),blocked,now,binding.holder],
+        ))?;
+        database(tx.commit())?;
+        Ok(changed == 1)
+    }
+
+    pub(super) fn record_activation_sent(
+        &mut self,
+        dispatch_id: i64,
+        idempotency_key: &str,
+        sent_at: i64,
+    ) -> Result<Dispatch> {
+        let spent = format!("FENCE_SPENT:{idempotency_key}");
+        let changed = database(self.connection.execute(
+            "UPDATE dispatch_outbox SET state='SENT',sent_at=?3,updated_at=?3 WHERE id=?1 AND state='WAKE_INTENT' AND idempotency_key=?2 AND recovery_state=?4 AND wake_intent_at<?3",
+            params![dispatch_id,idempotency_key,sent_at,spent],
+        ))?;
+        if changed != 1 {
+            return Err("Only a spent activation fence may be marked SENT".into());
+        }
+        self.dispatch(dispatch_id)?
+            .ok_or("Control-plane dispatch disappeared".into())
+    }
+
     pub(super) fn record_wake_intent(
         &mut self,
         dispatch_id: i64,
@@ -1096,7 +1274,7 @@ impl Store {
 
     pub(super) fn record_sent(&mut self, dispatch_id: i64, sent_at: i64) -> Result<Dispatch> {
         let changed = database(self.connection.execute(
-            "UPDATE dispatch_outbox SET state='SENT',sent_at=?2,updated_at=?2 WHERE id=?1 AND state='WAKE_INTENT' AND wake_intent_at<?2",
+            "UPDATE dispatch_outbox SET state='SENT',sent_at=?2,updated_at=?2 WHERE id=?1 AND state='WAKE_INTENT' AND wake_intent_at<?2 AND recovery_state IS NULL",
             params![dispatch_id,sent_at],
         ))?;
         if changed != 1 {
@@ -1127,7 +1305,7 @@ impl Store {
         let matched: Option<i64> = database(
             self.connection
                 .query_row(
-                    "SELECT id FROM dispatch_outbox WHERE state IN ('WAKE_INTENT','SENT') AND target_pubkey=?1 AND channel_id=?2 AND thread_root_id=?3 AND ack_marker=?4 AND wake_intent_at<?5 ORDER BY id LIMIT 1",
+                    "SELECT id FROM dispatch_outbox WHERE state IN ('WAKE_INTENT','SENT') AND (recovery_state IS NULL OR recovery_state NOT GLOB 'FENCE_*') AND target_pubkey=?1 AND channel_id=?2 AND thread_root_id=?3 AND ack_marker=?4 AND wake_intent_at<?5 ORDER BY id LIMIT 1",
                     params![event.author_pubkey,event.channel_id,event.thread_root_id,event.content,event.created_at],
                     |row| row.get(0),
                 )
@@ -1135,7 +1313,7 @@ impl Store {
         )?;
         if let Some(dispatch_id) = matched {
             let changed = database(self.connection.execute(
-                "UPDATE dispatch_outbox SET state='ACKED',ack_event_id=?2,acknowledged_at=?3,updated_at=?3 WHERE id=?1 AND state IN ('WAKE_INTENT','SENT') AND ack_event_id IS NULL",
+                "UPDATE dispatch_outbox SET state='ACKED',ack_event_id=?2,acknowledged_at=?3,updated_at=?3 WHERE id=?1 AND state IN ('WAKE_INTENT','SENT') AND (recovery_state IS NULL OR recovery_state NOT GLOB 'FENCE_*') AND ack_event_id IS NULL",
                 params![dispatch_id,event.event_id,event.created_at],
             ))?;
             if changed == 1 {
@@ -1177,6 +1355,101 @@ impl Store {
         })
     }
 
+    pub(super) fn activation_cursor(&self, source: &str) -> Result<Option<String>> {
+        database(
+            self.connection
+                .query_row(
+                    "SELECT cursor FROM event_cursors WHERE source=?1",
+                    [source],
+                    |row| row.get(0),
+                )
+                .optional(),
+        )
+    }
+
+    pub(super) fn reconcile_activation_startup(
+        &mut self,
+        source: &str,
+        cursor: &str,
+        events: &[SignedAckEvent<'_>],
+        now: i64,
+        stale_claim_before: i64,
+    ) -> Result<StartupReconciliation> {
+        if source.is_empty()
+            || source.len() > 256
+            || now < 0
+            || stale_claim_before < 0
+            || stale_claim_before > now
+        {
+            return Err("Invalid activation reconnect boundary".into());
+        }
+        let next_cursor = cursor
+            .parse::<u64>()
+            .map_err(|_| "Activation cursor must be a canonical u64")?;
+        if next_cursor.to_string() != cursor {
+            return Err("Activation cursor must be a canonical u64".into());
+        }
+        let tx = database(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )?;
+        let current_cursor: Option<String> = database(
+            tx.query_row(
+                "SELECT cursor FROM event_cursors WHERE source=?1",
+                [source],
+                |row| row.get(0),
+            )
+            .optional(),
+        )?;
+        let cursor_advances = !current_cursor
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|current| next_cursor <= current);
+
+        let mut acknowledged = Vec::new();
+        for event in events.iter().filter(|_| cursor_advances) {
+            if event.event_id.is_empty() || event.event_id.len() > 128 {
+                continue;
+            }
+            let matched: Option<i64> = database(
+                tx.query_row(
+                    "SELECT d.id FROM dispatch_outbox d JOIN objectives o ON o.objective_id=d.objective_id WHERE d.state IN ('WAKE_INTENT','SENT') AND d.recovery_state=('FENCE_SPENT:' || d.idempotency_key) AND d.objective_generation=o.generation AND o.state='ACTIVE' AND d.target_pubkey=?1 AND d.channel_id=?2 AND d.thread_root_id=?3 AND d.ack_marker=?4 AND d.wake_intent_at<?5 AND d.ack_event_id IS NULL ORDER BY d.id LIMIT 1",
+                    params![event.author_pubkey,event.channel_id,event.thread_root_id,event.content,event.created_at],
+                    |row| row.get(0),
+                )
+                .optional(),
+            )?;
+            if let Some(dispatch_id) = matched {
+                let changed = database(tx.execute(
+                    "UPDATE dispatch_outbox SET state='ACKED',ack_event_id=?2,acknowledged_at=?3,updated_at=?3 WHERE id=?1 AND state IN ('WAKE_INTENT','SENT') AND recovery_state=('FENCE_SPENT:' || idempotency_key) AND ack_event_id IS NULL",
+                    params![dispatch_id,event.event_id,event.created_at],
+                ))?;
+                if changed == 1 {
+                    acknowledged.push(dispatch_id);
+                }
+            }
+        }
+        database(tx.execute(
+            "UPDATE dispatch_outbox SET state='PENDING',lease_holder=NULL,claimed_at=NULL,claim_expires_at=NULL,recovery_state='STALE_CLAIM_RECOVERED',updated_at=?1 WHERE state='CLAIMED' AND recovery_state='ACTIVATION_CLAIMED' AND wake_intent_at IS NULL AND claim_expires_at<=?2",
+            params![now,stale_claim_before],
+        ))?;
+        database(tx.execute(
+            "UPDATE dispatch_outbox SET state='VERIFY_BEFORE_RETRY',recovery_state='UNCERTAIN_WAKE_BOUNDARY',updated_at=?1 WHERE state='WAKE_INTENT' AND recovery_state IN ('FENCE_READY:' || idempotency_key,'FENCE_SPENT:' || idempotency_key,'FENCE_BLOCKED:' || idempotency_key)",
+            [now],
+        ))?;
+        if cursor_advances {
+            database(tx.execute(
+                "INSERT INTO event_cursors(source,cursor,updated_at) VALUES (?1,?2,?3) ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor,updated_at=excluded.updated_at",
+                params![source,cursor,now],
+            ))?;
+        }
+        database(tx.commit())?;
+        Ok(StartupReconciliation {
+            acknowledged,
+            wake_dispatches: Vec::new(),
+        })
+    }
+
     pub(super) fn reconcile_startup(
         &mut self,
         events: &[SignedAckEvent<'_>],
@@ -1190,11 +1463,11 @@ impl Store {
             }
         }
         database(self.connection.execute(
-            "UPDATE dispatch_outbox SET state='PENDING',lease_holder=NULL,claimed_at=NULL,claim_expires_at=NULL,recovery_state='STALE_CLAIM_RECOVERED',updated_at=?1 WHERE state='CLAIMED' AND claim_expires_at<=?2",
+            "UPDATE dispatch_outbox SET state='PENDING',lease_holder=NULL,claimed_at=NULL,claim_expires_at=NULL,recovery_state='STALE_CLAIM_RECOVERED',updated_at=?1 WHERE state='CLAIMED' AND (recovery_state IS NULL OR recovery_state!='ACTIVATION_CLAIMED') AND claim_expires_at<=?2",
             params![now,stale_claim_before],
         ))?;
         database(self.connection.execute(
-            "UPDATE dispatch_outbox SET state='VERIFY_BEFORE_RETRY',recovery_state='UNCERTAIN_WAKE_BOUNDARY',updated_at=?1 WHERE state='WAKE_INTENT'",
+            "UPDATE dispatch_outbox SET state='VERIFY_BEFORE_RETRY',recovery_state='UNCERTAIN_WAKE_BOUNDARY',updated_at=?1 WHERE state='WAKE_INTENT' AND (recovery_state IS NULL OR recovery_state NOT GLOB 'FENCE_*')",
             [now],
         ))?;
         database(self.connection.execute(
@@ -1303,13 +1576,16 @@ fn dispatch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dispatch> {
         idempotency_key: row.get(9)?,
         ack_marker: row.get(10)?,
         wake_payload: row.get(11)?,
-        claimed_at: row.get(12)?,
-        wake_intent_at: row.get(13)?,
-        sent_at: row.get(14)?,
-        ack_event_id: row.get(15)?,
-        acknowledged_at: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        lease_holder: row.get(12)?,
+        claimed_at: row.get(13)?,
+        claim_expires_at: row.get(14)?,
+        wake_intent_at: row.get(15)?,
+        sent_at: row.get(16)?,
+        ack_event_id: row.get(17)?,
+        acknowledged_at: row.get(18)?,
+        recovery_state: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
     })
 }
 
@@ -1346,6 +1622,25 @@ fn smoke_dispatch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SmokeDispatch
         created_at: row.get(17)?,
         updated_at: row.get(18)?,
     })
+}
+
+fn validate_wake_intent(holder: &str, input: &WakeIntentInput<'_>) -> Result<()> {
+    if holder.is_empty()
+        || holder.len() > 256
+        || input.target_agent_key.is_empty()
+        || input.target_agent_key.len() > 256
+        || !hex64(input.target_pubkey)
+        || input.channel_id.is_empty()
+        || input.channel_id.len() > 256
+        || !hex64(input.thread_root_id)
+        || input.idempotency_key.is_empty()
+        || input.idempotency_key.len() > 256
+        || input.instruction.is_empty()
+        || input.instruction.len() > 3_500
+    {
+        return Err("Invalid frozen wake intent".into());
+    }
+    Ok(())
 }
 
 fn hex64(value: &str) -> bool {

@@ -1,3 +1,4 @@
+mod activation_boundary;
 mod coordinator;
 mod store;
 
