@@ -6,6 +6,7 @@ import type { BuzzClient, Context } from "./client";
 import {
   type AddedTool,
   callSessionTool,
+  durableMutation,
   type SessionTool,
   sessionTools,
 } from "./session-tools";
@@ -76,7 +77,17 @@ export async function respond(
           args as Record<string, unknown>,
           added,
         );
-        return result({ content: content(reply) });
+        return result({
+          content: content(reply),
+          ...(durableMutation(
+            name,
+            args as Record<string, unknown>,
+            reply,
+            added,
+          )
+            ? { _meta: { buzz: { durableMutation: true } } }
+            : {}),
+        });
       } catch (error) {
         return result({
           content: [{ type: "text", text: errorText(error) }],

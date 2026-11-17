@@ -519,7 +519,13 @@ export class AcpProcess {
       method === "tools/call" &&
       !response.error &&
       !(response.result as { isError?: unknown } | undefined)?.isError;
+    const durableMutation = (
+      response.result as
+        | { _meta?: { buzz?: { durableMutation?: unknown } } }
+        | undefined
+    )?._meta?.buzz?.durableMutation;
     if (worked && ANSWERS.has(String(call.name))) session?.answered();
+    if (worked && durableMutation === true) session?.committed();
     if (worked && isFinalMessage(call.name, call.arguments))
       session?.finished();
     return response;

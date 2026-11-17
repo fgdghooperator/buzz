@@ -78,6 +78,9 @@ export class AcpSession {
   /** Whether this work answered in Buzz, and what the harness wrote meanwhile: a
    * provider failure comes back as text, and text is never posted. */
   private acted = false;
+  /** Whether a successful tool call explicitly confirmed a durable material
+   * mutation during this burst. Never inferred from response text. */
+  private durableMutation = false;
   private written = "";
   private closed = false;
   /** The work the owner stopped, while the harness ends it: the messages it
@@ -196,6 +199,11 @@ export class AcpSession {
   /** A Buzz tool that answers, such as `send`, succeeded. */
   answered() {
     this.acted = true;
+  }
+
+  /** A successful tool call durably committed material state. */
+  committed() {
+    this.durableMutation = true;
   }
 
   /** Called by the process with each `session/update` for this session. */
@@ -489,9 +497,17 @@ export class AcpSession {
     // harness: a model that forgot `send`, or one that cannot reach its provider.
     const text = this.acted || this.stopped ? "" : this.written.trim();
     const failure = this.lastFailure;
+    const presented = this.acted && failure?.error;
+    const committed = this.durableMutation && failure?.error;
+    const recovered =
+      committed && !this.acted
+        ? "⚠️ The action completed, but I couldn't finish presenting the response. Durable state is authoritative; I'll resume from it on the next turn."
+        : "";
     this.settle({
-      ...(failure?.error ? { ok: false, ...failure } : { ok: true }),
-      ...(text ? { text } : {}),
+      ...(failure?.error && !presented && !committed
+        ? { ok: false, ...failure }
+        : { ok: true }),
+      ...(recovered || text ? { text: recovered || text } : {}),
       ...(!failure?.error && this.stopped?.ended ? { stopped: true } : {}),
     });
   }
@@ -507,6 +523,7 @@ export class AcpSession {
     const failure = this.lastFailure;
     this.lastFailure = undefined;
     this.acted = false;
+    this.durableMutation = false;
     this.written = "";
     for (const [scope, receipt] of this.active)
       if (stopped.receipts.has(receipt)) this.active.delete(scope);
@@ -536,6 +553,7 @@ export class AcpSession {
     this.displaced.clear();
     this.lastFailure = undefined;
     this.acted = false;
+    this.durableMutation = false;
     this.written = "";
     this.stopped = undefined;
     const owner = this.owner ?? this.waiters.at(-1);

@@ -1,0 +1,17 @@
+{
+  "id": "fgd.remh-continuation-pilot",
+  "name": "REMH Continuation Pilot",
+  "apiVersion": 1,
+  "description": "Disabled-by-default deterministic REMH continuation pilot with role-based wake routing.",
+  "host": {
+    "commands": [
+      {
+        "id": "pilot",
+        "program": "remh-continuation-host-rem165-v1",
+        "args": [],
+        "maxInputBytes": 65536,
+        "maxOutputBytes": 262144
+      }
+    ]
+  }
+}

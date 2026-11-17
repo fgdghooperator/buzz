@@ -8,3 +8,6 @@ mod tests;
 
 #[cfg(test)]
 mod continuation_contract_tests;
+
+#[cfg(test)]
+mod continuation_pilot_tests;

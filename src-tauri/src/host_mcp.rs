@@ -453,9 +453,7 @@ fn join(shared: &Shared, named: bool, body: &str) -> Result<Join, StatusCode> {
         // for editor-provided MCP servers. The bearer token still gates the
         // request; shared_session only permits the same authorized tool
         // session to be rediscovered after its initial legacy claim.
-        Some("server/discover" | "ping")
-            if state != CLAIMED || shared.shared_session =>
-        {
+        Some("server/discover" | "ping") if state != CLAIMED || shared.shared_session => {
             Ok(Join::Outside)
         }
         _ => Err(StatusCode::NOT_FOUND),

@@ -13,6 +13,7 @@ import type {
 } from "../../host/service";
 import { AgentSessions, ServerPool, SHARED_POOL } from "./agent-sessions";
 import { AcpProcess, REQUEST_TIMEOUT_MS } from "./process";
+import { AcpSession } from "./session";
 import type { AcpHooks, ToolServer } from "./types";
 
 type Message = {
@@ -571,6 +572,37 @@ describe("a session without hooks", () => {
       expect(harness.sent("session/close")).toHaveLength(close ? 1 : 0);
       expect(session.open).toBe(false);
     }
+  });
+
+  it("records a durable mutation reported by a successful MCP tool call", async () => {
+    const harness = fakeHarness();
+    const process = await start(harness);
+    const session = new AcpSession(process, "session-commit");
+    const committed = vi.spyOn(session, "committed");
+    const mcp = process as unknown as {
+      mcp(
+        tools: ToolServer,
+        session: AcpSession,
+        message: unknown,
+      ): Promise<unknown>;
+    };
+    const server: ToolServer = async (_conversation, message) => ({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        content: [{ type: "text", text: "done" }],
+        _meta: { buzz: { durableMutation: true } },
+      },
+    });
+
+    await mcp.mcp(server, session, {
+      id: 1,
+      method: "tools/call",
+      params: { name: "plugin_write", arguments: {} },
+    });
+
+    expect(committed).toHaveBeenCalledOnce();
+    await process.stop();
   });
 });
 

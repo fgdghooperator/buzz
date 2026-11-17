@@ -67,6 +67,29 @@ it("lists the tools as the harness has it, and without their load by default", a
   );
 });
 
+it("marks a successful plugin tool result when the plugin confirms a durable commit", async () => {
+  const client = {} as import("./client").BuzzClient;
+  const committed = {
+    ...tool("plugin_write"),
+    commits: true,
+  };
+  const readOnly = tool("plugin_read");
+  const call = (name: string) =>
+    respond(
+      client,
+      {},
+      { id: 1, method: "tools/call", params: { name, arguments: {} } },
+      [committed, readOnly],
+    ) as Promise<{
+      result: { _meta?: { buzz?: { durableMutation?: boolean } } };
+    }>;
+
+  expect((await call("plugin_write")).result._meta).toEqual({
+    buzz: { durableMutation: true },
+  });
+  expect((await call("plugin_read")).result._meta).toBeUndefined();
+});
+
 it("holds a protected tool until approval and executes only the reviewed arguments", async () => {
   let allow!: () => void;
   let entered!: () => void;

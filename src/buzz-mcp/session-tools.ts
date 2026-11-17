@@ -36,6 +36,11 @@ export type AddedTool = Readonly<{
   name: string;
   description: string;
   inputSchema: Readonly<Record<string, unknown>>;
+  /** Whether a successful call confirms a durable material mutation. The
+   * marker is host/runtime metadata, not text inferred from the reply. */
+  commits?:
+    | boolean
+    | ((args: Readonly<Record<string, unknown>>, reply: Reply) => boolean);
   /** Runs it as the agent working in `context`. A throw is a tool error for
    * the agent to correct. */
   call(
@@ -171,6 +176,20 @@ export async function callSessionTool(
   }
   await client.protect?.({ kind: "tool-result", session, content: reply });
   return reply;
+}
+
+/** Whether a successful added-tool result explicitly confirms a durable
+ * material mutation. Built-in and unmarked plugin tools never imply one. */
+export function durableMutation(
+  name: string,
+  args: Readonly<Record<string, unknown>>,
+  reply: Reply,
+  added: readonly AddedTool[] = [],
+) {
+  const commits = added.find((tool) => tool.name === name)?.commits;
+  return typeof commits === "function"
+    ? commits(args, reply) === true
+    : commits === true;
 }
 
 /** File capture and dispatch errors cross the same tool-result boundary. */
